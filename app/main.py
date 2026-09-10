@@ -60,6 +60,26 @@ UPLOAD_PASSPHRASE = os.environ.get("UPLOAD_PASSPHRASE")
 # connection than a hard size rejection. See README "Known limits".
 
 
+@app.after_request
+def allow_teams_embedding(response):
+    """
+    By default, Flask doesn't set any framing headers, which can leave
+    Teams uncertain whether it's safe to embed this page in a tab's
+    iframe — Teams falls back to opening the page in an external browser
+    window instead. Explicitly allowing Teams' own domains as frame
+    ancestors fixes this. (Deliberately not touching X-Frame-Options here
+    — it's the older, single-origin mechanism and is superseded by CSP
+    frame-ancestors for this purpose; setting both can conflict.)
+    """
+    response.headers["Content-Security-Policy"] = (
+        "frame-ancestors 'self' https://teams.microsoft.com "
+        "https://*.teams.microsoft.com https://*.skype.com "
+        "https://teams.microsoft.us https://*.teams.microsoft.us "
+        "https://*.cloud.microsoft"
+    )
+    return response
+
+
 @app.route("/", methods=["GET"])
 def upload_page():
     """Serves the staff-facing upload page."""
