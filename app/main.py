@@ -51,6 +51,12 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com"
 # entirely (not recommended once this is shared beyond initial testing).
 UPLOAD_PASSPHRASE = os.environ.get("UPLOAD_PASSPHRASE")
 
+# Staff must submit their own @waktanjong.org email so the meeting summary
+# can be posted to their personal chat with Flow bot (Power Automate uses
+# this to address the "Post message in a chat or channel" action at that
+# specific person, rather than only posting to a shared channel).
+REQUIRED_EMAIL_DOMAIN = os.environ.get("REQUIRED_EMAIL_DOMAIN", "waktanjong.org")
+
 # Cloud Run itself supports request bodies up to 32MB by default on the
 # older gen1 execution environment, but gen2 (the current default for new
 # services) supports considerably larger streamed uploads — multipart
@@ -114,6 +120,8 @@ def process_meeting():
             if provided != UPLOAD_PASSPHRASE:
                 return jsonify({"success": False, "error": "Incorrect passphrase"}), 401
 
+        staff_email = _validate_staff_email(request.form.get("staffEmail", ""))
+
         if "recording" not in request.files:
             return jsonify({"success": False, "error": "No 'recording' file in upload"}), 400
 
@@ -150,6 +158,7 @@ def process_meeting():
         response_payload = {
             "success": True,
             "title": meeting_title,
+            "staffEmail": staff_email,
             "summary": result.get("summary", ""),
             "keyDiscussions": result.get("keyDiscussions", []),
             "decisions": result.get("decisions", []),
@@ -159,9 +168,16 @@ def process_meeting():
         # 5. Forward to Power Automate so it can post into Teams. This is
         #    a tiny JSON payload regardless of original recording size, so
         #    it never touches Power Automate's 100MB/120s HTTP limits.
+        #    staffEmail lets the flow post to that person's personal chat
+        #    with Flow bot, not just a shared channel.
         _forward_to_teams(response_payload)
 
         return jsonify(response_payload)
+
+    except InvalidEmailError as e:
+        # Deliberately returned before any file handling or Gemini calls
+        # run, so a bad/missing email never triggers a paid API call.
+        return jsonify({"success": False, "error": str(e)}), 400
 
     except Exception as e:  # noqa: BLE001 - always return JSON, never a raw 500 HTML page
         logger.exception("Failed to process meeting")
@@ -189,6 +205,35 @@ def _forward_to_teams(payload):
     except Exception:
         logger.exception("Failed to forward result to Power Automate webhook")
         raise
+
+
+class InvalidEmailError(Exception):
+    pass
+
+
+def _validate_staff_email(email):
+    """
+    Requires a non-empty email ending in @REQUIRED_EMAIL_DOMAIN (case-
+    insensitive). Raises InvalidEmailError with a clear message if not —
+    caught in process_meeting() and returned as a 400 before any file
+    handling or Gemini calls happen, so an invalid email never triggers
+    a paid API call.
+    """
+    email = (email or "").strip()
+    if not email:
+        raise InvalidEmailError("Your @waktanjong.org email is required.")
+
+    domain_suffix = "@" + REQUIRED_EMAIL_DOMAIN.lower()
+    if not email.lower().endswith(domain_suffix):
+        raise InvalidEmailError(f"Email must be a {domain_suffix} address.")
+
+    # Light sanity check beyond just the domain suffix — catches obvious
+    # typos like "@@waktanjong.org" or missing a local part before the @.
+    local_part = email[: -len(domain_suffix)]
+    if not local_part or "@" in local_part or " " in email:
+        raise InvalidEmailError(f"That doesn't look like a valid {domain_suffix} address.")
+
+    return email
 
 
 def _strip_extension(filename):

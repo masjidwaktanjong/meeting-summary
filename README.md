@@ -65,7 +65,9 @@ below.)
      human-facing form, so it needs to be something a person can type.
 5. You can remove `API_SECRET` if it's still set from the earlier
    version - it's no longer used by this version of the code.
-6. Keep `GEMINI_API_KEY` as-is (rotate it first if you haven't since it
+6. Optionally set `REQUIRED_EMAIL_DOMAIN` - defaults to `waktanjong.org`
+   if not set, so you only need this if MWT's domain ever changes.
+7. Keep `GEMINI_API_KEY` as-is (rotate it first if you haven't since it
    was accidentally shown in a screenshot earlier).
 
 ### First-time setup (if deploying fresh)
@@ -117,6 +119,7 @@ Teams.
    {
      "success": true,
      "title": "Weekly Sync",
+     "staffEmail": "hafizuddin@waktanjong.org",
      "summary": "The team discussed...",
      "keyDiscussions": ["Point one", "Point two"],
      "decisions": ["Decision one"],
@@ -125,8 +128,9 @@ Teams.
    }
    ```
 2. Power Automate will generate the JSON schema automatically from this
-   sample - this is what lets you reference `title`, `summary`, etc. as
-   dynamic content later without a separate Parse JSON step.
+   sample - this is what lets you reference `title`, `summary`,
+   `staffEmail`, etc. as dynamic content later without a separate Parse
+   JSON step.
 3. **Save the flow once** (even without adding more steps yet) - this
    generates the actual webhook URL, shown at the top of the trigger card
    as **"HTTP POST URL"**. Copy this.
@@ -134,40 +138,53 @@ Teams.
    `POWER_AUTOMATE_WEBHOOK_URL` environment variable (Part 1 above), then
    redeploy the Cloud Run revision so it picks up the new variable.
 
-### Step 3: Post to Teams
-**+ New step** -> **"Post card in a chat or channel"** (Microsoft Teams connector)
+### Step 3: Post to the staff member's personal chat with Flow bot
+**+ New step** -> **"Post message in a chat or channel"** (Microsoft Teams connector)
 - Post as: **Flow bot**
-- Post in: **Channel**
-- Team / Channel: pick your destination
-- Adaptive Card JSON:
-  ```json
-  {
-    "type": "AdaptiveCard",
-    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-    "version": "1.4",
-    "body": [
-      { "type": "TextBlock", "text": "Meeting Summary: @{triggerBody()?['title']}", "weight": "Bolder", "size": "Medium", "wrap": true },
-      { "type": "TextBlock", "text": "@{triggerBody()?['summary']}", "wrap": true },
-      { "type": "TextBlock", "text": "Key Discussions", "weight": "Bolder", "wrap": true },
-      { "type": "TextBlock", "text": "- @{join(triggerBody()?['keyDiscussions'], '\n- ')}", "wrap": true },
-      { "type": "TextBlock", "text": "Decisions Made", "weight": "Bolder", "wrap": true },
-      { "type": "TextBlock", "text": "- @{join(triggerBody()?['decisions'], '\n- ')}", "wrap": true },
-      { "type": "TextBlock", "text": "Action Items", "weight": "Bolder", "wrap": true },
-      { "type": "TextBlock", "text": "- @{join(triggerBody()?['actionItems'], '\n- ')}", "wrap": true }
-    ]
-  }
+- Post in: **Chat with Flow bot**
+- Recipient: click into this field and insert the dynamic content
+  `staffEmail` (from the trigger) - this addresses the message directly
+  to whoever uploaded the recording, using the email they typed on the
+  upload form.
+- Message: build the summary text using dynamic content, e.g.:
   ```
-  Note: this version uses `triggerBody()?[...]` directly (no `Parse_JSON`
-  step needed) since the "When a HTTP request is received" trigger already
-  parses the incoming JSON against the schema from Step 2.
+  📝 Meeting Summary: @{triggerBody()?['title']}
+
+  @{triggerBody()?['summary']}
+
+  Key Discussions:
+  - @{join(triggerBody()?['keyDiscussions'], '\n- ')}
+
+  Decisions Made:
+  - @{join(triggerBody()?['decisions'], '\n- ')}
+
+  Action Items:
+  - @{join(triggerBody()?['actionItems'], '\n- ')}
+  ```
+  (Plain text works fine here since "Post message" doesn't render
+  Adaptive Cards the way "Post card in a chat or channel" does - if you
+  want the nicer card layout instead, swap this step for **"Post card in
+  a chat or channel"** with **Post in: Chat with Flow bot** and
+  **Recipient: staffEmail**, using the same Adaptive Card JSON structure
+  from the channel-posting version of this project.)
+
+**Note on staffEmail validation**: Cloud Run already rejects any upload
+where the email doesn't end in `@waktanjong.org` before any processing
+happens (see `_validate_staff_email` in `app/main.py`), so by the time
+Power Automate receives this webhook call, `staffEmail` is guaranteed to
+be a real MWT address - safe to use directly as the chat recipient
+without extra validation in the flow itself.
 
 ### Step 4: Handle failure
 **+ New step** -> **Condition**
 - Left: dynamic content -> `success` (from the trigger)
 - Operator: **is equal to**
 - Right: `false`
-- **If yes:** **"Post message in a chat or channel"** -> same channel ->
-  text: `Meeting summary failed: @{triggerBody()?['error']}`
+- **If yes:** **"Post message in a chat or channel"** -> **Chat with Flow
+  bot** -> Recipient: `staffEmail` -> text:
+  `Meeting summary failed: @{triggerBody()?['error']}` - this tells the
+  specific staff member their upload failed, rather than only logging it
+  somewhere no one checks.
 
 ### Step 5: Respond to Cloud Run (recommended)
 Cloud Run's forwarding call waits up to 30 seconds for a response from
@@ -253,3 +270,20 @@ maintainer understands why, rather than re-discovering the same dead ends:
    version, since reliably obtaining the .vtt turned out not to be
    possible without adding a manual step - and adding staff steps was
    explicitly ruled out as counter to the goal of zero-effort adoption.
+5. **Teams tab embedding was attempted** via the generic "Website" tab
+   type, but Teams kept opening it in an external browser window instead
+   of a true embedded iframe, even after adding a permissive
+   Content-Security-Policy header. A full custom Teams app manifest would
+   likely fix this, but wasn't pursued given the timeline - the page
+   works fine as a plain link shared in the channel instead.
+6. **Personal chat delivery was attempted via a Power App Teams-tab
+   front-end** (using `User().Email` for automatic identity), which would
+   have solved both the tab-embedding and per-user-identity problems at
+   once. Set aside because it would have needed a Custom Connector to
+   avoid re-introducing Power Automate's 100MB/120s file-size wall, on
+   top of an app manifest - too much new surface area for the remaining
+   timeline. **Resolved instead with a simple required email field** on
+   the existing HTML form (validated both client-side and server-side
+   against the `@waktanjong.org` domain), passed through Cloud Run to
+   Power Automate, which uses it to post the summary directly to that
+   person's chat with Flow bot.

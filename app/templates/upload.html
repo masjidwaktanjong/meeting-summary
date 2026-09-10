@@ -83,6 +83,10 @@
 
   <div class="card">
     <form id="uploadForm">
+      <label for="staffEmail">Your email</label>
+      <input type="email" id="staffEmail" placeholder="you@waktanjong.org" required pattern=".+@waktanjong\.org">
+      <div class="hint">Must be your @waktanjong.org email — the summary gets sent to your Teams chat with Flow bot.</div>
+
       <label for="passphrase">Passphrase</label>
       <input type="password" id="passphrase" required>
       <div class="hint">Ask in the team channel if you don't have this.</div>
@@ -102,8 +106,8 @@
   </div>
 
   <div class="note">
-    Once processing finishes, the summary is posted automatically into the
-    Teams channel — no need to download or copy anything from here.
+    Once processing finishes, the summary is posted automatically to your
+    Teams chat with Flow bot — no need to download or copy anything from here.
   </div>
 
   <script>
@@ -126,6 +130,13 @@
       const recordingFile = document.getElementById('recording').files[0];
       const passphrase = document.getElementById('passphrase').value;
       const meetingTitle = document.getElementById('meetingTitle').value;
+      const staffEmail = document.getElementById('staffEmail').value.trim();
+
+      if (!staffEmail.toLowerCase().endsWith('@waktanjong.org')) {
+        setStatus('error', 'Please enter your @waktanjong.org email.');
+        submitBtn.disabled = false;
+        return;
+      }
 
       if (!recordingFile) {
         setStatus('error', 'Please choose a recording file.');
@@ -137,6 +148,7 @@
       formData.append('recording', recordingFile);
       formData.append('passphrase', passphrase);
       formData.append('meetingTitle', meetingTitle);
+      formData.append('staffEmail', staffEmail);
 
       setStatus('working', 'Uploading — this can take a while for large recordings, please keep this tab open…');
 
@@ -170,7 +182,7 @@
           return;
         }
 
-        setStatus('done', 'Done! The summary has been posted to the Teams channel.');
+        setStatus('done', 'Done! The summary has been sent to your Teams chat with Flow bot.');
       };
 
       xhr.onerror = () => {
