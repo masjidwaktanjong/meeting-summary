@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MWT Meeting Summary</title>
+  <style>
+    :root {
+      --brand: #0f5132;
+      --brand-light: #e8f3ee;
+      --border: #d8dee4;
+      --text: #1c1f23;
+      --muted: #667085;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      max-width: 560px;
+      margin: 32px auto;
+      padding: 0 20px;
+      color: var(--text);
+      background: #fafbfc;
+    }
+    h1 { font-size: 1.35rem; margin-bottom: 4px; }
+    .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+    .card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    label { display: block; font-weight: 600; font-size: 0.85rem; margin-bottom: 6px; margin-top: 16px; }
+    label:first-child { margin-top: 0; }
+    input[type="text"], input[type="password"], input[type="file"] {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.9rem;
+    }
+    .hint { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+    button {
+      background: var(--brand);
+      color: white;
+      border: none;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 20px;
+    }
+    button:disabled { background: #9db8ac; cursor: not-allowed; }
+    #status {
+      display: none;
+      margin-top: 16px;
+      padding: 14px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+    }
+    #status.working { display: block; background: #fff8e1; color: #7a5b00; }
+    #status.error { display: block; background: #fdecea; color: #7a1f14; }
+    #status.done { display: block; background: var(--brand-light); color: var(--brand); }
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid #7a5b0055;
+      border-top-color: #7a5b00;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 8px;
+      vertical-align: -2px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .note { font-size: 0.78rem; color: var(--muted); margin-top: 20px; line-height: 1.5; }
+    progress { width: 100%; margin-top: 10px; height: 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>MWT Meeting Summary</h1>
+  <div class="subtitle">Upload a Teams recording (.mp4) to get an automatic summary posted to Teams — handles English, Malay, and Arabic.</div>
+
+  <div class="card">
+    <form id="uploadForm">
+      <label for="passphrase">Passphrase</label>
+      <input type="password" id="passphrase" required>
+      <div class="hint">Ask in the team channel if you don't have this.</div>
+
+      <label for="meetingTitle">Meeting title (optional)</label>
+      <input type="text" id="meetingTitle" placeholder="e.g. Programme Ops Weekly – 10 Sep 2026">
+
+      <label for="recording">Recording file (.mp4)</label>
+      <input type="file" id="recording" accept=".mp4,.m4a,.mp3,.wav" required>
+      <div class="hint">The recording file Teams saved after the meeting. Large files may take a few minutes to upload — keep this tab open.</div>
+
+      <button type="submit" id="submitBtn">Generate Summary</button>
+      <progress id="progressBar" value="0" max="100" style="display:none;"></progress>
+    </form>
+
+    <div id="status"></div>
+  </div>
+
+  <div class="note">
+    Once processing finishes, the summary is posted automatically into the
+    Teams channel — no need to download or copy anything from here.
+  </div>
+
+  <script>
+    const form = document.getElementById('uploadForm');
+    const statusEl = document.getElementById('status');
+    const submitBtn = document.getElementById('submitBtn');
+    const progressBar = document.getElementById('progressBar');
+
+    function setStatus(type, message) {
+      statusEl.className = type;
+      statusEl.innerHTML = type === 'working' ? '<span class="spinner"></span>' + message : message;
+    }
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitBtn.disabled = true;
+      progressBar.style.display = 'block';
+      progressBar.value = 0;
+
+      const recordingFile = document.getElementById('recording').files[0];
+      const passphrase = document.getElementById('passphrase').value;
+      const meetingTitle = document.getElementById('meetingTitle').value;
+
+      if (!recordingFile) {
+        setStatus('error', 'Please choose a recording file.');
+        submitBtn.disabled = false;
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('recording', recordingFile);
+      formData.append('passphrase', passphrase);
+      formData.append('meetingTitle', meetingTitle);
+
+      setStatus('working', 'Uploading — this can take a while for large recordings, please keep this tab open…');
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/process', true);
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const pct = Math.round((event.loaded / event.total) * 100);
+          progressBar.value = pct;
+          if (pct < 100) {
+            setStatus('working', 'Uploading… ' + pct + '%');
+          } else {
+            setStatus('working', 'Upload complete — transcribing and summarising, this can take a few minutes…');
+          }
+        }
+      };
+
+      xhr.onload = () => {
+        submitBtn.disabled = false;
+        let result;
+        try {
+          result = JSON.parse(xhr.responseText);
+        } catch (err) {
+          setStatus('error', 'Unexpected response from server. Please try again or check with your admin.');
+          return;
+        }
+
+        if (!result.success) {
+          setStatus('error', 'Something went wrong: ' + (result.error || 'unknown error'));
+          return;
+        }
+
+        setStatus('done', 'Done! The summary has been posted to the Teams channel.');
+      };
+
+      xhr.onerror = () => {
+        submitBtn.disabled = false;
+        setStatus('error', 'Upload failed — check your connection and try again.');
+      };
+
+      xhr.send(formData);
+    });
+  </script>
+</body>
+</html>

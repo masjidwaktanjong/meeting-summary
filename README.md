@@ -1,241 +1,255 @@
-# MWT Meeting Summary API (Cloud Run)
+# MWT Meeting Summary API (v3 - Upload Page + Teams Webhook)
 
-A small, self-contained service: receives a meeting recording, strips it to
-audio-only, sends it to Gemini for accurate English/Malay/Arabic
-transcription and summarisation, and returns structured JSON (summary, key
-discussions, decisions, action items) for Power Automate to post into a
-Teams channel.
+Staff visit a simple web page, upload their meeting recording, and a
+summary (key discussions, decisions, action items) posts automatically
+into a Teams channel a few minutes later. No folder-hunting, no separate
+transcript file, no Power Automate form with fiddly file-picker fields.
 
-Runs on **Google Cloud Run's free tier** (effectively $0/month at MWT's
-meeting volume — see "Cost" below). No Apps Script, no personal Google
-account dependency for the compute itself — just a container anyone with a
-free Google Cloud account can deploy.
-
-## Why Cloud Run and not [other option]
-
-- **Cloudflare Workers (free)** can't do this — Workers Free caps CPU time
-  at 10ms per request, nowhere near enough to run `ffmpeg`. Cloud Run gives
-  a real container with real CPU/memory, so audio extraction just works.
-- **Google Apps Script** was the original build, but ties the whole system
-  to whichever Google account owns the script — an institutional
-  hand-off problem once the person who set it up leaves. This version is
-  plain Python in a Docker container, deployable under *any* Google
-  account (or in principle, any container host at all).
+This is the third iteration of this system - see the version history note
+at the bottom for why earlier designs (Apps Script, "For a selected file"
+trigger, base64-through-Power-Automate) were set aside.
 
 ## How it works
 
 ```
-Staff right-clicks recording.mp4 in their own OneDrive/SharePoint folder
+Staff visit the Cloud Run URL, upload recording.mp4 + type a passphrase
         |
         v
-Power Automate flow: "For a selected file" (manual trigger)
+Cloud Run (this service)
         |
-        +- Looks for a matching .vtt in the same folder
-        |
-        v
-HTTP POST -> this Cloud Run service (/process)
-        |
-        +- ffmpeg strips video, keeps audio-only (shrinks file size a lot,
-        |  and works around Power Automate/Cloud Run request-size limits)
+        +- Streams the upload straight to disk (not base64/JSON - that
+        |  would inflate a 238MB file to ~317MB for no reason)
+        +- ffmpeg strips video, keeps audio-only (huge size reduction)
         +- Uploads audio to Gemini's Files API
         +- Gemini produces: summary, key discussions, decisions, action items
         v
-Returns JSON to Power Automate
+Cloud Run POSTs the small JSON result to a Power Automate
+"When a HTTP request is received" flow
         |
         v
 Power Automate posts an Adaptive Card into the Teams channel
 ```
 
+**The key design point**: Power Automate never touches the actual
+recording. It only ever receives a small JSON summary at the very end -
+this is what avoids Power Automate's hard limits (100MB request body cap,
+120-second timeout) entirely, since those limits made the earlier
+"send the whole file through Power Automate" designs impossible for
+MWT's real recording sizes (200MB+ for a 30-minute meeting).
+
 ---
 
-## Part 1 - Deploy to Cloud Run (~20 minutes, one-time)
+## Part 1 - Deploy to Cloud Run
 
-You'll need a Google account (ideally one MWT controls long-term, e.g. a
-shared admin account — not a personal one, for the same continuity reason
-that motivated moving off Apps Script) and the `gcloud` CLI installed, or
-you can deploy straight from the Cloud Console UI without any local setup.
+(You've already done the Google Cloud account + billing + initial
+deployment setup from the earlier version - this is an update to that
+same service, not a fresh setup. If starting fresh, see "First-time setup"
+below.)
 
-### Option A - Deploy from the Cloud Console (no local tools needed)
-1. Go to https://console.cloud.google.com → create a new project (e.g.
-   "mwt-meeting-summary").
-2. **Enable billing** on the project — required even for free-tier usage,
-   but you will not be charged unless MWT's usage grows far beyond current
-   meeting volume (see "Cost" below).
-3. Go to **Cloud Run** → **Deploy container** → **Continuously deploy from
-   a repository** (this connects to a GitHub repo containing this code —
-   push this folder to a new GitHub repo first if you haven't).
-4. Region: pick one close to Singapore (e.g. `asia-southeast1`).
-5. Under **Container, Networking, Security → Variables & Secrets**, add
-   environment variables:
-   - `GEMINI_API_KEY` = your Gemini API key (see step 6 below)
-   - `API_SECRET` = a random string you make up — this is the shared
-     secret Power Automate must send with every request, so random
-     internet traffic can't trigger paid Gemini calls against your key.
-6. Get a Gemini API key at https://aistudio.google.com/apikey (use the
-   same Google account as this Cloud Run project for simplicity). Enable
-   billing on it too — paid tier is required for production use since the
-   free tier lets Google use your inputs to improve their models, which
-   isn't appropriate for internal meeting content. Paid tier costs
-   roughly $0.037/minute of audio (~$3.30 for a 90-minute meeting).
-7. **Deploy**. Cloud Run will build the container from the Dockerfile and
-   give you a service URL like `https://mwt-meeting-summary-xxxx.a.run.app`.
-8. Set **minimum instances to 0** (default) so it scales to zero and costs
-   nothing when idle — this is already the default, just don't change it.
-9. Set the **request timeout** to at least 600 seconds (Cloud Run's
-   default is 300s, which may not be enough for a long recording's
-   ffmpeg + Gemini processing time) — under the service's **Edit &
-   Deploy New Revision → Container → Request timeout**.
+### Updating an existing deployment
+1. Push this folder's contents to the same GitHub repo Cloud Run is
+   watching, replacing the old files.
+2. Cloud Run's continuous deployment trigger will automatically rebuild
+   and redeploy - or trigger it manually from the Cloud Run console if
+   auto-deploy isn't set up.
+3. **Add one new environment variable** (Cloud Run console -> your service
+   -> Edit & Deploy New Revision -> Variables & Secrets):
+   - `POWER_AUTOMATE_WEBHOOK_URL` = the URL from Part 2 below (you'll get
+     this once you build the Power Automate flow - come back and fill
+     this in after Part 2)
+4. **Rename/add** the passphrase variable:
+   - `UPLOAD_PASSPHRASE` = a simple word or phrase staff will type on the
+     upload form (e.g. pin this in the Teams channel description so
+     staff can find it). This replaces the old `API_SECRET` - the old one
+     protected a machine-to-machine API call; this one protects a
+     human-facing form, so it needs to be something a person can type.
+5. You can remove `API_SECRET` if it's still set from the earlier
+   version - it's no longer used by this version of the code.
+6. Keep `GEMINI_API_KEY` as-is (rotate it first if you haven't since it
+   was accidentally shown in a screenshot earlier).
 
-### Option B - Deploy from the command line (if you have gcloud installed)
-```bash
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
-gcloud run deploy mwt-meeting-summary \
-  --source . \
-  --region asia-southeast1 \
-  --allow-unauthenticated \
-  --timeout 600 \
-  --set-env-vars GEMINI_API_KEY=your_key_here,API_SECRET=your_secret_here
-```
+### First-time setup (if deploying fresh)
+1. Google Cloud Console -> new project -> **enable billing**.
+2. Cloud Run -> **Deploy container** -> **Continuously deploy from a
+   repository** -> connect this repo.
+3. Region: `asia-southeast1` (closest to Singapore).
+4. **Authentication: Allow public access** (this is correct and
+   intentional - the `UPLOAD_PASSPHRASE` check inside the app is what
+   actually protects it, not Cloud Run's own auth gate; Cloud Run auth
+   would block staff's browsers too, since they don't have Google
+   identity tokens).
+5. **Billing: Request-based** (scales to zero between uses, free at
+   MWT's volume).
+6. Environment variables (Variables & Secrets tab):
+   - `GEMINI_API_KEY` = your Gemini API key
+   - `UPLOAD_PASSPHRASE` = a simple shared phrase for staff
+   - `POWER_AUTOMATE_WEBHOOK_URL` = fill in after building Part 2
+7. **Container -> Settings -> Request timeout**: set to `600` seconds
+   (default 300s may not be enough for a long recording).
+8. Deploy. Copy the service URL - this is what you'll share with staff.
 
 ### Quick sanity check
-Visit the Cloud Run service URL in a browser — you should see:
+Visit `https://your-service-url.a.run.app/health` - should show:
 ```json
 {"status":"ok","message":"MWT Meeting Summary API is running."}
 ```
+Visit the root URL (`https://your-service-url.a.run.app/`) - should show
+the upload form.
 
 ---
 
-## Part 2 - Power Automate flow (~20 minutes)
+## Part 2 - Power Automate flow (receiving side)
 
-Same overall shape as before, pointed at the new Cloud Run URL instead of
-an Apps Script Web App URL.
+This flow does the opposite of earlier versions: instead of *sending* a
+file, it *receives* a small JSON result from Cloud Run and posts it to
+Teams.
 
-### Trigger
-- **For a selected file** (OneDrive for Business or SharePoint) — shows up
-  as a right-click option on any file, in any staff member's own folder.
+### Step 1: Create the flow
+1. **make.powerautomate.com** -> **Create** -> **Instant cloud flow**
+2. Name: `MWT Meeting Summary - Post to Teams`
+3. Trigger: search for and select **"When a HTTP request is received"**
+4. **Create**
 
-### Step 1 - Get file content
-- **Get file content**, using the trigger's file reference.
+### Step 2: Configure the trigger
+1. On the trigger card, click **"Use sample payload to generate schema"**
+   and paste this:
+   ```json
+   {
+     "success": true,
+     "title": "Weekly Sync",
+     "summary": "The team discussed...",
+     "keyDiscussions": ["Point one", "Point two"],
+     "decisions": ["Decision one"],
+     "actionItems": ["Action one"],
+     "error": ""
+   }
+   ```
+2. Power Automate will generate the JSON schema automatically from this
+   sample - this is what lets you reference `title`, `summary`, etc. as
+   dynamic content later without a separate Parse JSON step.
+3. **Save the flow once** (even without adding more steps yet) - this
+   generates the actual webhook URL, shown at the top of the trigger card
+   as **"HTTP POST URL"**. Copy this.
+4. **Go back to Cloud Run** and paste this URL into the
+   `POWER_AUTOMATE_WEBHOOK_URL` environment variable (Part 1 above), then
+   redeploy the Cloud Run revision so it picks up the new variable.
 
-### Step 2 - Try to find the matching .vtt
-- **Compose**: `replace(triggerOutputs()?['body/Name'], '.mp4', '.vtt')`
-- **List files in folder** (same folder as the trigger file)
-- **Condition**: does a file with that name exist in the listing?
-  - **If yes:** **Get file content** for the .vtt
-  - **If no:** continue with an empty transcript — summary/discussions/
-    decisions/action items still generate, just without a speaker-labels
-    confirmation flag
-
-### Step 3 - Call the Cloud Run API
-- **HTTP** action
-  - Method: `POST`
-  - URI: `https://mwt-meeting-summary-xxxx.a.run.app/process` (your actual
-    Cloud Run URL + `/process`)
-  - Headers: `Content-Type: application/json`
-  - Body:
-    ```json
-    {
-      "fileBase64": "@{base64(body('Get_file_content'))}",
-      "fileName": "@{triggerOutputs()?['body/Name']}",
-      "mimeType": "video/mp4",
-      "vttText": "@{if(equals(outputs('Condition')?['status'], 'Skipped'), '', body('Get_file_content_2'))}",
-      "meetingTitle": "@{triggerOutputs()?['body/Name']}",
-      "apiSecret": "PASTE_YOUR_API_SECRET_HERE"
-    }
-    ```
-  - As before, re-confirm the exact dynamic-content expressions against
-    your actual flow's action names once built — Power Automate names
-    them based on build order.
-
-### Step 4 - Parse the response
-- **Parse JSON**, schema:
+### Step 3: Post to Teams
+**+ New step** -> **"Post card in a chat or channel"** (Microsoft Teams connector)
+- Post as: **Flow bot**
+- Post in: **Channel**
+- Team / Channel: pick your destination
+- Adaptive Card JSON:
   ```json
   {
-    "type": "object",
-    "properties": {
-      "success": { "type": "boolean" },
-      "title": { "type": "string" },
-      "summary": { "type": "string" },
-      "keyDiscussions": { "type": "array", "items": { "type": "string" } },
-      "decisions": { "type": "array", "items": { "type": "string" } },
-      "actionItems": { "type": "array", "items": { "type": "string" } },
-      "hasSpeakerLabels": { "type": "boolean" },
-      "error": { "type": "string" }
-    }
+    "type": "AdaptiveCard",
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "version": "1.4",
+    "body": [
+      { "type": "TextBlock", "text": "Meeting Summary: @{triggerBody()?['title']}", "weight": "Bolder", "size": "Medium", "wrap": true },
+      { "type": "TextBlock", "text": "@{triggerBody()?['summary']}", "wrap": true },
+      { "type": "TextBlock", "text": "Key Discussions", "weight": "Bolder", "wrap": true },
+      { "type": "TextBlock", "text": "- @{join(triggerBody()?['keyDiscussions'], '\n- ')}", "wrap": true },
+      { "type": "TextBlock", "text": "Decisions Made", "weight": "Bolder", "wrap": true },
+      { "type": "TextBlock", "text": "- @{join(triggerBody()?['decisions'], '\n- ')}", "wrap": true },
+      { "type": "TextBlock", "text": "Action Items", "weight": "Bolder", "wrap": true },
+      { "type": "TextBlock", "text": "- @{join(triggerBody()?['actionItems'], '\n- ')}", "wrap": true }
+    ]
   }
   ```
+  Note: this version uses `triggerBody()?[...]` directly (no `Parse_JSON`
+  step needed) since the "When a HTTP request is received" trigger already
+  parses the incoming JSON against the schema from Step 2.
 
-### Step 5 - Post to Teams
-- **Post card in a chat or channel**, Adaptive Card body referencing
-  `body('Parse_JSON')?['summary']`, `?['keyDiscussions']`, `?['decisions']`,
-  `?['actionItems']` — same card JSON as documented in the previous
-  version's spec.
+### Step 4: Handle failure
+**+ New step** -> **Condition**
+- Left: dynamic content -> `success` (from the trigger)
+- Operator: **is equal to**
+- Right: `false`
+- **If yes:** **"Post message in a chat or channel"** -> same channel ->
+  text: `Meeting summary failed: @{triggerBody()?['error']}`
 
-### Step 6 - Handle failure
-- **Condition**: `body('Parse_JSON')?['success']` equals `false` → post a
-  short failure message (with `?['error']`) instead of silently doing
-  nothing.
+### Step 5: Respond to Cloud Run (recommended)
+Cloud Run's forwarding call waits up to 30 seconds for a response from
+this webhook. Add a **"Response"** action (Request connector) at the end
+returning a simple `200 OK` - without this, Power Automate's default
+response can be slow enough to occasionally cause Cloud Run's forwarding
+call to time out (the Teams post itself would likely still succeed, but
+Cloud Run's own logs would show a spurious error). Response body:
+`{"status": "received"}`, status code `200`.
 
 ---
 
-## Cost
+## Part 3 - Test end to end
 
-At MWT's realistic volume (a handful of meetings a week):
+1. Visit the Cloud Run URL.
+2. Enter the passphrase, pick a real recording, submit.
+3. Watch the progress bar - large files take a while to upload depending
+   on the connection; this is normal and expected.
+4. Once upload finishes, the page shows "transcribing and summarising" -
+   this can take several minutes for a long recording (ffmpeg extraction
+   + Gemini processing time combined).
+5. Check the Teams channel for the posted card.
+6. If it fails, check:
+   - **Cloud Run logs** (Console -> your service -> Logs) - most issues
+     (ffmpeg errors, Gemini API errors) will show clearly here
+   - **Power Automate run history** - confirms whether Cloud Run's
+     forwarded JSON actually reached the flow, and whether the Teams
+     post itself succeeded
 
-- **Cloud Run**: $0. Free tier is 180,000 vCPU-seconds and 360,000
-  GiB-seconds per month, and this allowance renews monthly and never
-  expires. Even generously estimating 2 minutes of actual CPU time per
-  meeting (ffmpeg + relay overhead) and 20 meetings/month, that's 2,400
-  vCPU-seconds/month — about 1.3% of the free allowance.
-- **Gemini API (paid tier)**: ~$0.037/minute of audio. A 90-minute meeting
-  costs about $3.30; weekly meetings run roughly $13-15/month. This is the
-  only real recurring cost in the whole system.
-
-## Portability to other masjids
-
-This is a plain Docker container with no MWT-specific configuration baked
-into the code — everything masjid-specific (Gemini key, secret, meeting
-title formatting) is either an environment variable or safely genericised
-in the prompt already. To stand this up for another masjid:
-
-1. They (or whoever supports them technically) push this same repo to
-   their own GitHub, or just copy the folder.
-2. They create their own free Google Cloud project and their own Gemini
-   API key — nobody inherits MWT's or your personal account.
-3. Deploy following Part 1 above, ~20 minutes.
-4. They build their own Power Automate flow following Part 2, pointing at
-   their own Cloud Run URL.
-
-No code changes needed for a different organisation's name/context beyond
-optionally editing the prompt string in `app/main.py`'s `_gemini_summarize`
-function, which currently says "Islamic education organisation in
-Singapore" — a different org would want to adjust that framing sentence,
-nothing else.
+---
 
 ## Known limits
 
-- **No chunking** — a single Gemini request per recording. Should handle
-  meetings up to a few hours based on Gemini's audio limits, but hasn't
-  been stress-tested past ~1.5-2hrs against Cloud Run's request timeout
-  (currently set to 600s in the deploy steps above — increase if a real
-  test shows longer recordings need more time for ffmpeg + Gemini
-  processing combined).
-- **Request size** — the recording arrives as base64 JSON in Power
-  Automate's HTTP action body, before audio extraction happens server-side
-  (extraction can't happen before upload, since it needs Cloud Run's CPU).
-  This means the *original* video file's size is still what matters for
-  Power Automate's own outbound request limits. If a raw recording is
-  large enough to be rejected before it even reaches this service, the
-  fallback is either a client-side audio-only conversion step before
-  upload (adds a manual step for staff), or splitting delivery across
-  multiple smaller HTTP calls — not built here, flagged for testing first.
-- **Full transcript is not returned** in this version, only the
-  summary/discussions/decisions/action items — matching the simplified
-  Teams-channel-card scope. The Gemini call could be extended to also
-  return full timestamped segments if a future version wants to save a
-  complete transcript alongside the short-form card.
-- **Speaker names aren't woven into the summary** — the .vtt is only
-  checked for the presence of speaker tags (`hasSpeakerLabels`), not used
-  to attribute individual discussion points, since Gemini already
-  attributes points to people where they're named in the audio itself.
+- **No chunking** - a single Gemini request per recording. Untested past
+  ~1.5-2hrs of audio against Cloud Run's request timeout.
+- **Upload time depends on staff's connection** - a 200MB+ file over a
+  slow connection could take several minutes just to upload before
+  processing even starts. The progress bar keeps staff informed, but
+  there's no way around physics here without asking staff to pre-shrink
+  files (which was deliberately ruled out to keep this a true one-step,
+  zero-effort process).
+- **Passphrase is basic protection, not real security** - anyone with the
+  passphrase can trigger a paid Gemini call. Fine for an internal tool
+  shared within a small organisation; if this becomes a problem, a
+  proper login system would be the next step, but wasn't judged worth
+  the added complexity for MWT's scale and timeline.
+- **No download option in this version** - staff never see or download
+  anything from the upload page itself; the only output is the Teams
+  post. If someone needs the raw text later, it currently only exists in
+  the Teams channel history and inside the Gemini/Cloud Run logs
+  transiently, not saved anywhere durable. Worth flagging as a gap if
+  MWT wants a searchable archive of past summaries later.
+
+## Version history (for institutional record)
+
+Earlier designs were tried and set aside - documented here so a future
+maintainer understands why, rather than re-discovering the same dead ends:
+
+1. **Google Apps Script Web App** (staff upload form -> downloadable .md)
+   - worked, but tied the whole system to a personal Google account,
+   creating a handover problem when the builder leaves the role.
+2. **Apps Script as a pure JSON API, called by Power Automate's
+   "For a selected file" trigger** - solved the account-portability
+   concern partially (moved to Cloud Run later) but assumed recordings
+   and their .vtt transcripts sit in a predictable, watchable folder.
+   In practice, recordings live in each staff member's own OneDrive (or
+   a channel's SharePoint library if the meeting was held in a channel),
+   and the "Transcript" file next to a recording turned out to sometimes
+   be another small .mp4, not a .vtt - the actual .vtt has to be
+   downloaded separately from within Teams/Stream. This made automatic,
+   no-staff-effort triggering unreliable.
+3. **Sending the recording through Power Automate's HTTP action** (either
+   to Apps Script or Cloud Run) - hit two hard Microsoft-side limits:
+   Power Automate's HTTP action caps around 100MB request bodies and
+   times out at 120 seconds for synchronous calls, neither of which is
+   configurable. MWT's real recordings (200MB+ for a 30-minute meeting,
+   since screen-share video inflates file size heavily) don't fit either
+   constraint.
+4. **This version** - moves the file upload *out* of Power Automate
+   entirely. Staff upload directly to Cloud Run (which has no such size
+   limit for a real container), and Power Automate only ever handles the
+   tiny JSON result at the end. Speaker labels were also dropped in this
+   version, since reliably obtaining the .vtt turned out not to be
+   possible without adding a manual step - and adding staff steps was
+   explicitly ruled out as counter to the goal of zero-effort adoption.

@@ -1,13 +1,22 @@
 """
 MWT Meeting Summary API (Cloud Run)
 -----------------------------------
-Receives a meeting recording (video or audio) plus an optional .vtt
-transcript, strips the recording down to audio-only using ffmpeg (this is
-the step that can't run on Cloudflare Workers' free tier, since it needs
-real CPU time, not just I/O waiting), uploads the audio to Gemini's Files
-API, and asks Gemini to produce a structured summary: key discussions,
-decisions made, and action items. Designed to be called from a Power
-Automate "HTTP" action.
+Staff visit this service's web page, upload a meeting recording directly
+from their browser (multipart file upload — NOT base64/JSON, which would
+inflate a 238MB file to ~317MB and hit request-size limits sooner), and
+the service:
+  1. Strips the recording to audio-only using ffmpeg (real CPU work —
+     this is why Cloud Run is used instead of an edge/Workers platform)
+  2. Uploads the audio to Gemini's Files API
+  3. Asks Gemini for a structured summary: key discussions, decisions,
+     action items
+  4. Forwards that small JSON result to a Power Automate "When a HTTP
+     request is received" flow, which posts it into a Teams channel
+
+Power Automate never sees the actual recording — only the small JSON
+summary at the very end — which avoids Power Automate's HTTP action
+limits (100MB body cap, 120-second timeout) entirely, since those don't
+apply to the tiny outbound payload.
 
 Portable by design: this whole service is a plain Flask app in a Docker
 container. Any masjid (or MWT after a staff handover) can redeploy it
@@ -15,36 +24,49 @@ under their own free Google Cloud Run project — nothing here is tied to
 a specific Google account. See README.md for deploy steps.
 """
 
-import base64
 import json
 import logging
 import os
 import subprocess
 import tempfile
 import time
-import uuid
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-API_SECRET = os.environ.get("API_SECRET")  # shared secret Power Automate must send
+POWER_AUTOMATE_WEBHOOK_URL = os.environ.get("POWER_AUTOMATE_WEBHOOK_URL")  # where results get posted
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 
-# Cloud Run request body limit is 32MB by default for standard HTTP requests.
-# We expect the raw recording to arrive base64-encoded in JSON, so keep an
-# eye on this — if MWT's recordings routinely exceed that even before audio
-# extraction, the fallback documented in README.md (client-side pre-trim) is
-# needed. See README "Known limits" section.
-MAX_REQUEST_MB = 200  # Flask/Werkzeug side limit; actual platform ceiling may differ
+# Simple shared passphrase, entered on the upload form itself, so a
+# stranger who finds the URL can't trigger paid Gemini calls. Not meant to
+# be strong security — just enough friction that only staff who were given
+# the passphrase (e.g. pinned in the Teams channel) can use it. Set this
+# in Cloud Run's environment variables; leave unset to disable the check
+# entirely (not recommended once this is shared beyond initial testing).
+UPLOAD_PASSPHRASE = os.environ.get("UPLOAD_PASSPHRASE")
+
+# Cloud Run itself supports request bodies up to 32MB by default on the
+# older gen1 execution environment, but gen2 (the current default for new
+# services) supports considerably larger streamed uploads — multipart
+# file uploads are streamed to disk rather than buffered fully in memory,
+# so this is not the same hard wall the old base64-JSON approach hit.
+# Real-world ceiling is more likely to be upload time over a slow
+# connection than a hard size rejection. See README "Known limits".
 
 
 @app.route("/", methods=["GET"])
+def upload_page():
+    """Serves the staff-facing upload page."""
+    return render_template("upload.html")
+
+
+@app.route("/health", methods=["GET"])
 def health():
     """Simple health check / sanity endpoint."""
     return jsonify({"status": "ok", "message": "MWT Meeting Summary API is running."})
@@ -53,102 +75,100 @@ def health():
 @app.route("/process", methods=["POST"])
 def process_meeting():
     """
-    Expects JSON body:
-    {
-      "fileBase64": "...",          # the recording, base64-encoded
-      "fileName": "recording.mp4",
-      "mimeType": "video/mp4",      # best guess is fine; we re-detect via ffmpeg anyway
-      "vttText": "...",             # optional, empty string if not supplied
-      "meetingTitle": "...",        # optional
-      "apiSecret": "..."            # must match API_SECRET env var
-    }
+    Expects a multipart/form-data POST (a normal browser file upload form):
+      - file field named "recording" — the .mp4/.m4a/.mp3 recording
+      - form field "meetingTitle" (optional)
 
-    Returns JSON:
-    {
-      "success": true,
-      "title": "...",
-      "summary": "...",
-      "keyDiscussions": [...],
-      "decisions": [...],
-      "actionItems": [...],
-      "hasSpeakerLabels": true/false
-    }
+    Streams the upload to a temp file (not buffered as base64/JSON — that
+    would inflate a 238MB file to ~317MB and made the old design hit
+    request-size limits sooner than necessary).
+
+    On success, forwards a small JSON summary to POWER_AUTOMATE_WEBHOOK_URL
+    (if configured) so it can be posted into Teams, AND returns the same
+    JSON directly to the browser so the upload page can show a live result
+    without waiting on Teams.
     """
     try:
-        _check_auth(request)
-        payload = request.get_json(force=True, silent=False)
+        if UPLOAD_PASSPHRASE:
+            provided = request.form.get("passphrase", "")
+            if provided != UPLOAD_PASSPHRASE:
+                return jsonify({"success": False, "error": "Incorrect passphrase"}), 401
 
-        if not payload or "fileBase64" not in payload:
-            return jsonify({"success": False, "error": "fileBase64 is required"}), 400
+        if "recording" not in request.files:
+            return jsonify({"success": False, "error": "No 'recording' file in upload"}), 400
 
-        file_name = payload.get("fileName", "recording.mp4")
-        meeting_title = payload.get("meetingTitle") or _strip_extension(file_name)
-        vtt_text = payload.get("vttText", "") or ""
+        uploaded = request.files["recording"]
+        if uploaded.filename == "":
+            return jsonify({"success": False, "error": "Empty filename"}), 400
+
+        file_name = uploaded.filename
+        meeting_title = request.form.get("meetingTitle") or _strip_extension(file_name)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = os.path.join(tmpdir, file_name)
             audio_path = os.path.join(tmpdir, "audio.m4a")
 
-            # 1. Decode and save the uploaded recording.
-            raw_bytes = base64.b64decode(payload["fileBase64"])
-            with open(input_path, "wb") as f:
-                f.write(raw_bytes)
-            logger.info("Received file %s (%d bytes)", file_name, len(raw_bytes))
+            # 1. Stream the uploaded recording straight to disk.
+            uploaded.save(input_path)
+            input_size = os.path.getsize(input_path)
+            logger.info("Received file %s (%d bytes)", file_name, input_size)
 
-            # 2. Extract audio-only using ffmpeg. This is the step that
-            #    needs a real container (Cloud Run), not a 10ms-CPU-capped
-            #    edge Worker. -vn drops video entirely; we re-encode to a
-            #    modest-bitrate AAC (.m4a) to shrink file size substantially
-            #    versus the original video file.
+            # 2. Extract audio-only using ffmpeg. Needs a real container
+            #    (Cloud Run), not a CPU-time-capped edge Worker. -vn drops
+            #    video entirely; re-encoded to a modest-bitrate mono AAC
+            #    to shrink size well below the original video file.
             _extract_audio(input_path, audio_path)
             audio_size = os.path.getsize(audio_path)
-            logger.info("Extracted audio: %d bytes", audio_size)
+            logger.info("Extracted audio: %d bytes (from %d byte original)", audio_size, input_size)
 
-            # 3. Upload audio to Gemini's Files API (handles large files
-            #    without hitting generateContent's inline request-size cap).
+            # 3. Upload audio to Gemini's Files API.
             file_uri, file_mime = _gemini_upload_file(audio_path, "audio/mp4")
 
             # 4. Ask Gemini to summarize.
             result = _gemini_summarize(file_uri, file_mime)
 
-        has_speaker_labels = _vtt_has_speakers(vtt_text)
+        response_payload = {
+            "success": True,
+            "title": meeting_title,
+            "summary": result.get("summary", ""),
+            "keyDiscussions": result.get("keyDiscussions", []),
+            "decisions": result.get("decisions", []),
+            "actionItems": result.get("actionItems", []),
+        }
 
-        return jsonify(
-            {
-                "success": True,
-                "title": meeting_title,
-                "summary": result.get("summary", ""),
-                "keyDiscussions": result.get("keyDiscussions", []),
-                "decisions": result.get("decisions", []),
-                "actionItems": result.get("actionItems", []),
-                "hasSpeakerLabels": has_speaker_labels,
-            }
-        )
+        # 5. Forward to Power Automate so it can post into Teams. This is
+        #    a tiny JSON payload regardless of original recording size, so
+        #    it never touches Power Automate's 100MB/120s HTTP limits.
+        _forward_to_teams(response_payload)
 
-    except AuthError as e:
-        return jsonify({"success": False, "error": str(e)}), 401
-    except Exception as e:  # noqa: BLE001 - want to always return JSON, never a raw 500 HTML page
+        return jsonify(response_payload)
+
+    except Exception as e:  # noqa: BLE001 - always return JSON, never a raw 500 HTML page
         logger.exception("Failed to process meeting")
-        return jsonify({"success": False, "error": str(e)}), 500
+        error_payload = {"success": False, "error": str(e)}
+        # Best-effort: let the Teams channel know it failed too, so
+        # failures aren't silent even if the staff member closes the tab.
+        try:
+            _forward_to_teams(error_payload)
+        except Exception:
+            logger.exception("Also failed to notify Teams of the failure")
+        return jsonify(error_payload), 500
 
 
-class AuthError(Exception):
-    pass
-
-
-def _check_auth(req):
-    """Shared-secret check so this endpoint can't be triggered by strangers
-    who find the URL and run up the Gemini bill. Power Automate sends the
-    secret as a field in the JSON body (simplest to configure from a flow,
-    no custom header wiring needed)."""
-    if not API_SECRET:
-        # No secret configured on the server — allow through, but this is
-        # not recommended for anything beyond initial local testing.
+def _forward_to_teams(payload):
+    """POSTs the result JSON to the configured Power Automate webhook
+    trigger, which posts it into the Teams channel. If no webhook URL is
+    configured, this is a no-op (useful for local testing before Power
+    Automate is wired up)."""
+    if not POWER_AUTOMATE_WEBHOOK_URL:
+        logger.warning("POWER_AUTOMATE_WEBHOOK_URL not configured — skipping Teams post")
         return
-    payload = req.get_json(force=True, silent=True) or {}
-    provided = payload.get("apiSecret")
-    if provided != API_SECRET:
-        raise AuthError("Unauthorized: missing or invalid API secret")
+    try:
+        resp = requests.post(POWER_AUTOMATE_WEBHOOK_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        logger.exception("Failed to forward result to Power Automate webhook")
+        raise
 
 
 def _strip_extension(filename):
@@ -308,14 +328,6 @@ def _gemini_summarize(file_uri, mime_type):
     result.setdefault("decisions", [])
     result.setdefault("actionItems", [])
     return result
-
-
-def _vtt_has_speakers(vtt_text):
-    """Quick check for whether the supplied .vtt contains speaker tags,
-    just to report hasSpeakerLabels back to the caller."""
-    if not vtt_text or not vtt_text.strip():
-        return False
-    return "<v " in vtt_text or "<v\t" in vtt_text
 
 
 if __name__ == "__main__":
