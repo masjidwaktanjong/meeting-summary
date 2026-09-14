@@ -1,29 +1,41 @@
 """
 MWT Meeting Summary API (Cloud Run)
 -----------------------------------
-Staff visit this service's web page, upload a meeting recording directly
-from their browser (multipart file upload — NOT base64/JSON, which would
-inflate a 238MB file to ~317MB and hit request-size limits sooner), and
-the service:
-  1. Strips the recording to audio-only using ffmpeg (real CPU work —
-     this is why Cloud Run is used instead of an edge/Workers platform)
-  2. Uploads the audio to Gemini's Files API
-  3. Asks Gemini for a structured summary: key discussions, decisions,
-     action items
-  4. Forwards that small JSON result to a Power Automate "When a HTTP
-     request is received" flow, which posts it into a Teams channel
+Staff visit this service's web page and upload a meeting recording. Cloud
+Run itself has a hard, non-configurable 32MB request size limit enforced
+at Google's front-end load balancer (confirmed via direct testing — see
+README "Known limits" — this is documented Google behaviour, not
+something fixable via memory/timeout/any setting in this project). Since
+MWT's real recordings run 200MB+, the upload can't go straight to
+/process. Instead:
 
-Power Automate never sees the actual recording — only the small JSON
-summary at the very end — which avoids Power Automate's HTTP action
-limits (100MB body cap, 120-second timeout) entirely, since those don't
-apply to the tiny outbound payload.
+  1. Browser asks this service for a short-lived signed upload URL
+     (GET /upload-url) pointing at a Google Cloud Storage bucket — GCS has
+     no such 32MB ceiling.
+  2. Browser uploads the recording DIRECTLY to that GCS URL (browser to
+     GCS, Cloud Run is not in this path at all, so the 32MB limit never
+     applies).
+  3. Browser then calls POST /process with just the GCS object path (a
+     tiny request), and Cloud Run downloads the file server-to-server
+     from GCS (no 32MB limit on server-to-server GCS reads either), then:
+       a. Strips the recording to audio-only using ffmpeg (real CPU work —
+          why Cloud Run is used instead of an edge/Workers platform)
+       b. Uploads the audio to Gemini's Files API
+       c. Asks Gemini for a structured summary: key discussions,
+          decisions, action items
+       d. Forwards that small JSON result to a Power Automate "When a
+          HTTP request is received" flow, which posts it into Teams
+  4. The uploaded GCS object is deleted after processing (success or
+     failure) — nothing lingers in the bucket.
 
 Portable by design: this whole service is a plain Flask app in a Docker
 container. Any masjid (or MWT after a staff handover) can redeploy it
 under their own free Google Cloud Run project — nothing here is tied to
-a specific Google account. See README.md for deploy steps.
+a specific Google account. See README.md for deploy steps, including the
+one extra setup step this version needs (creating the GCS bucket).
 """
 
+import datetime
 import json
 import logging
 import os
@@ -31,9 +43,11 @@ import re
 import subprocess
 import tempfile
 import time
+import uuid
 
 import requests
 from flask import Flask, jsonify, render_template, request
+from google.cloud import storage
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 POWER_AUTOMATE_WEBHOOK_URL = os.environ.get("POWER_AUTOMATE_WEBHOOK_URL")  # where results get posted
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")  # bucket for large-file uploads, see README
 # Gemini 2.5 models are being retired (shutdown announced for Oct 2026) and
 # were returning intermittent 404s on generateContent well before that date
 # — a known, widely-reported Google-side issue as the model family winds
@@ -51,6 +66,18 @@ POWER_AUTOMATE_WEBHOOK_URL = os.environ.get("POWER_AUTOMATE_WEBHOOK_URL")  # whe
 # it shouldn't need manual updating again the way a pinned name does.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
+
+_storage_client = None
+
+
+def _get_storage_client():
+    """Lazily creates the GCS client (avoids doing network/auth setup at
+    import time, which is unhelpful for tests and cold-start latency)."""
+    global _storage_client
+    if _storage_client is None:
+        _storage_client = storage.Client()
+    return _storage_client
+
 
 # Simple shared passphrase, entered on the upload form itself, so a
 # stranger who finds the URL can't trigger paid Gemini calls. Not meant to
@@ -107,6 +134,60 @@ def health():
     return jsonify({"status": "ok", "message": "MWT Meeting Summary API is running."})
 
 
+@app.route("/upload-url", methods=["POST"])
+def get_upload_url():
+    """
+    Step 1 of the large-file upload flow. The browser calls this first
+    (small request: passphrase + email + intended filename, no file
+    bytes) and gets back a short-lived signed URL to upload the actual
+    recording DIRECTLY to Google Cloud Storage — bypassing Cloud Run's
+    hard 32MB request size limit entirely, since Cloud Run is not in the
+    upload path for the large file at all.
+
+    Expects JSON body: { "passphrase": "...", "staffEmail": "...",
+    "fileName": "..." }
+    Returns JSON: { "success": true, "uploadUrl": "...", "objectName": "..." }
+    objectName is what the browser sends back to /process afterwards.
+    """
+    try:
+        if not GCS_BUCKET_NAME:
+            return jsonify({"success": False, "error": "Server is not configured with a storage bucket (GCS_BUCKET_NAME missing)."}), 500
+
+        payload = request.get_json(force=True, silent=True) or {}
+
+        if UPLOAD_PASSPHRASE:
+            if payload.get("passphrase") != UPLOAD_PASSPHRASE:
+                return jsonify({"success": False, "error": "Incorrect passphrase"}), 401
+
+        # Validate email at this stage too — no point issuing an upload
+        # URL for a request that /process would reject anyway.
+        _validate_staff_email(payload.get("staffEmail", ""))
+
+        original_name = payload.get("fileName") or "recording.mp4"
+        # Prefix with a UUID so concurrent uploads from different staff
+        # never collide on the same object name.
+        object_name = f"uploads/{uuid.uuid4().hex}-{original_name}"
+
+        client = _get_storage_client()
+        bucket = client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(object_name)
+
+        upload_url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(minutes=30),
+            method="PUT",
+            content_type="application/octet-stream",
+        )
+
+        return jsonify({"success": True, "uploadUrl": upload_url, "objectName": object_name})
+
+    except InvalidEmailError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to generate upload URL")
+        return jsonify({"success": False, "error": _scrub_secrets(str(e))}), 500
+
+
 @app.route("/debug/models", methods=["GET"])
 def debug_list_models():
     """
@@ -154,13 +235,15 @@ def debug_list_models():
 @app.route("/process", methods=["POST"])
 def process_meeting():
     """
-    Expects a multipart/form-data POST (a normal browser file upload form):
-      - file field named "recording" — the .mp4/.m4a/.mp3 recording
-      - form field "meetingTitle" (optional)
+    Step 2 of the large-file upload flow. Expects JSON (small — no file
+    bytes, just metadata):
+      { "passphrase": "...", "staffEmail": "...", "meetingTitle": "...",
+        "objectName": "uploads/xxxx-recording.mp4" }
 
-    Streams the upload to a temp file (not buffered as base64/JSON — that
-    would inflate a 238MB file to ~317MB and made the old design hit
-    request-size limits sooner than necessary).
+    objectName must be one returned by a prior /upload-url call. Cloud Run
+    downloads the actual file server-to-server from GCS (no 32MB limit
+    applies to server-to-server GCS reads, only to direct HTTP requests
+    hitting Cloud Run's own front end) before running ffmpeg + Gemini.
 
     On success, forwards a small JSON summary to POWER_AUTOMATE_WEBHOOK_URL
     (if configured) so it can be posted into Teams, AND returns the same
@@ -175,36 +258,47 @@ def process_meeting():
     a missing field there is null, and join() throws on null rather than
     treating it as empty — omitting fields on the error path previously
     crashed the Teams-posting step for every failed upload.
+
+    The GCS object is deleted after processing, success or failure, so
+    uploads don't accumulate in the bucket over time.
     """
     staff_email = ""  # populated once validated; used for error routing too
     meeting_title = ""
+    object_name = None
 
     try:
+        payload = request.get_json(force=True, silent=True) or {}
+
         if UPLOAD_PASSPHRASE:
-            provided = request.form.get("passphrase", "")
-            if provided != UPLOAD_PASSPHRASE:
+            if payload.get("passphrase") != UPLOAD_PASSPHRASE:
                 return _fail(401, "Incorrect passphrase", staff_email, meeting_title)
 
-        staff_email = _validate_staff_email(request.form.get("staffEmail", ""))
+        staff_email = _validate_staff_email(payload.get("staffEmail", ""))
 
-        if "recording" not in request.files:
-            return _fail(400, "No 'recording' file in upload", staff_email, meeting_title)
+        object_name = payload.get("objectName")
+        if not object_name:
+            return _fail(400, "No 'objectName' provided — upload may have failed before processing could start.", staff_email, meeting_title)
 
-        uploaded = request.files["recording"]
-        if uploaded.filename == "":
-            return _fail(400, "Empty filename", staff_email, meeting_title)
+        if not GCS_BUCKET_NAME:
+            return _fail(500, "Server is not configured with a storage bucket (GCS_BUCKET_NAME missing).", staff_email, meeting_title)
 
-        file_name = uploaded.filename
-        meeting_title = request.form.get("meetingTitle") or _strip_extension(file_name)
+        original_name = os.path.basename(object_name)
+        meeting_title = payload.get("meetingTitle") or _strip_extension(original_name)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            input_path = os.path.join(tmpdir, file_name)
+            input_path = os.path.join(tmpdir, original_name)
             audio_path = os.path.join(tmpdir, "audio.m4a")
 
-            # 1. Stream the uploaded recording straight to disk.
-            uploaded.save(input_path)
+            # 1. Download the recording from GCS server-to-server. No 32MB
+            #    limit here — that limit only applies to direct HTTP
+            #    requests hitting Cloud Run's own front end, not to this
+            #    service acting as a GCS client.
+            client = _get_storage_client()
+            bucket = client.bucket(GCS_BUCKET_NAME)
+            blob = bucket.blob(object_name)
+            blob.download_to_filename(input_path)
             input_size = os.path.getsize(input_path)
-            logger.info("Received file %s (%d bytes)", file_name, input_size)
+            logger.info("Downloaded %s from GCS (%d bytes)", object_name, input_size)
 
             # 2. Extract audio-only using ffmpeg. Needs a real container
             #    (Cloud Run), not a CPU-time-capped edge Worker. -vn drops
@@ -248,6 +342,16 @@ def process_meeting():
     except Exception as e:  # noqa: BLE001 - always return JSON, never a raw 500 HTML page
         logger.exception("Failed to process meeting")
         return _fail(500, _scrub_secrets(str(e)), staff_email, meeting_title)
+
+    finally:
+        # Clean up the uploaded object regardless of outcome, so failed or
+        # successful uploads don't linger in the bucket indefinitely.
+        if object_name and GCS_BUCKET_NAME:
+            try:
+                client = _get_storage_client()
+                client.bucket(GCS_BUCKET_NAME).blob(object_name).delete()
+            except Exception:
+                logger.exception("Failed to delete GCS object %s after processing", object_name)
 
 
 def _fail(status_code, error_message, staff_email, meeting_title):

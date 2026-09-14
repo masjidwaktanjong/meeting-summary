@@ -1,41 +1,66 @@
-# MWT Meeting Summary API (v3 - Upload Page + Teams Webhook)
+# MWT Meeting Summary API (v4 - Direct-to-Storage Upload + Teams Webhook)
 
 Staff visit a simple web page, upload their meeting recording, and a
-summary (key discussions, decisions, action items) posts automatically
-into a Teams channel a few minutes later. No folder-hunting, no separate
-transcript file, no Power Automate form with fiddly file-picker fields.
+summary (key discussions, decisions, action items) is sent automatically
+to their Teams chat with Flow bot a few minutes later. No folder-hunting,
+no separate transcript file, no Power Automate form with fiddly
+file-picker fields.
 
-This is the third iteration of this system - see the version history note
-at the bottom for why earlier designs (Apps Script, "For a selected file"
-trigger, base64-through-Power-Automate) were set aside.
+This is the fourth iteration of this system - see the version history
+note at the bottom for why earlier designs (Apps Script, "For a selected
+file" trigger, uploading straight to Cloud Run) were set aside. The
+short version: **Cloud Run has a hard, non-configurable 32MB request size
+limit**, enforced at Google's own front-end load balancer before your
+code ever runs - confirmed by direct testing (a `curl` upload of a 250MB
+file returned `413 Request Entity Too Large` from `Google Frontend`
+itself, with zero corresponding entry in the container's own logs, since
+the container was never involved). No memory increase, timeout increase,
+or code change can fix this - it's a platform-level ceiling. This version
+routes large files around Cloud Run entirely using Cloud Storage.
 
 ## How it works
 
 ```
-Staff visit the Cloud Run URL, upload recording.mp4 + type a passphrase
+Staff visit the Cloud Run URL, fill in email + passphrase, pick recording.mp4
+        |
+        v
+1. Browser asks Cloud Run for a short-lived signed upload URL (tiny
+   request - just filename + email, well under any size limit)
+        |
+        v
+2. Browser uploads the recording DIRECTLY to Google Cloud Storage using
+   that signed URL - Cloud Run is NOT in this path at all, so its 32MB
+   request limit never applies, regardless of file size
+        |
+        v
+3. Browser tells Cloud Run "the file is at gs://bucket/xxx.mp4, go"
+   (another tiny request - just an object name)
         |
         v
 Cloud Run (this service)
         |
-        +- Streams the upload straight to disk (not base64/JSON - that
-        |  would inflate a 238MB file to ~317MB for no reason)
+        +- Downloads the file from GCS server-to-server (no 32MB limit
+        |  on server-to-server GCS reads)
         +- ffmpeg strips video, keeps audio-only (huge size reduction)
         +- Uploads audio to Gemini's Files API
         +- Gemini produces: summary, key discussions, decisions, action items
+        +- Deletes the GCS object once done (success or failure)
         v
 Cloud Run POSTs the small JSON result to a Power Automate
 "When a HTTP request is received" flow
         |
         v
-Power Automate posts an Adaptive Card into the Teams channel
+Power Automate posts the summary to the staff member's personal chat
+with Flow bot
 ```
 
-**The key design point**: Power Automate never touches the actual
-recording. It only ever receives a small JSON summary at the very end -
-this is what avoids Power Automate's hard limits (100MB request body cap,
-120-second timeout) entirely, since those limits made the earlier
-"send the whole file through Power Automate" designs impossible for
-MWT's real recording sizes (200MB+ for a 30-minute meeting).
+**The key design point**: neither Power Automate NOR Cloud Run's own
+front end ever touches the actual recording as a direct HTTP body. Power
+Automate only ever receives a small JSON summary at the very end (avoids
+its 100MB/120s HTTP limits); Cloud Run only ever receives the large file
+via a server-to-server GCS download, never as an inbound HTTP request
+body (avoids Cloud Run's 32MB limit). Both of MWT's real hard blockers
+are sidestepped this way, for recordings of any realistic size.
 
 ---
 
@@ -46,47 +71,85 @@ deployment setup from the earlier version - this is an update to that
 same service, not a fresh setup. If starting fresh, see "First-time setup"
 below.)
 
+### New in this version: create a Cloud Storage bucket
+
+This version needs one new piece of infrastructure - a GCS bucket to
+receive large uploads before Cloud Run processes them.
+
+1. Cloud Console -> **Cloud Storage** -> **Buckets** -> **Create**.
+2. Name it something like `mwt-meeting-summary-uploads` (bucket names
+   are globally unique across all of Google Cloud, so add a distinguishing
+   prefix if that exact name is taken).
+3. Region: same as your Cloud Run service (`asia-southeast1`), so
+   downloads between them are fast and don't cross regions.
+4. Storage class: **Standard**.
+5. Access control: **Uniform** (the default) is fine.
+6. **Public access prevention: leave this ON** (the default) - nothing in
+   this bucket should be publicly readable; access happens only via the
+   short-lived signed URLs this service generates, and via the service's
+   own server-to-server downloads.
+7. Create the bucket, then copy its exact name for the environment
+   variable below.
+
+**Grant the Cloud Run service account permission to sign URLs.**
+Generating a signed upload URL requires a specific IAM permission
+(`iam.serviceAccounts.signBlob`) that isn't included by default, even for
+a service that otherwise has full access to its own bucket:
+1. Cloud Console -> **IAM & Admin** -> find the service account Cloud Run
+   is running as (usually `PROJECT_NUMBER-compute@developer.gserviceaccount.com`,
+   visible on your Cloud Run service's details page under "Security" or
+   "Service account").
+2. Grant it the **Storage Admin** role on the bucket (or at minimum
+   **Storage Object Admin**, scoped to just this bucket, for tighter
+   permissions) - this covers both the signed-URL generation and the
+   service's own reads/deletes.
+3. Also grant it the **Service Account Token Creator** role (on itself) -
+   this is specifically what allows `generate_signed_url()` to work from
+   within Cloud Run; without it, signed URL generation fails with a
+   permissions error even though the bucket access itself is fine.
+
 ### Updating an existing deployment
 1. Push this folder's contents to the same GitHub repo Cloud Run is
    watching, replacing the old files.
 2. Cloud Run's continuous deployment trigger will automatically rebuild
    and redeploy - or trigger it manually from the Cloud Run console if
    auto-deploy isn't set up.
-3. **Add one new environment variable** (Cloud Run console -> your service
+3. **Add these environment variables** (Cloud Run console -> your service
    -> Edit & Deploy New Revision -> Variables & Secrets):
+   - `GCS_BUCKET_NAME` = the bucket name from the step above (new in this
+     version - required, the service won't work without it)
    - `POWER_AUTOMATE_WEBHOOK_URL` = the URL from Part 2 below (you'll get
      this once you build the Power Automate flow - come back and fill
-     this in after Part 2)
-4. **Rename/add** the passphrase variable:
-   - `UPLOAD_PASSPHRASE` = a simple word or phrase staff will type on the
-     upload form (e.g. pin this in the Teams channel description so
-     staff can find it). This replaces the old `API_SECRET` - the old one
-     protected a machine-to-machine API call; this one protects a
-     human-facing form, so it needs to be something a person can type.
-5. You can remove `API_SECRET` if it's still set from the earlier
-   version - it's no longer used by this version of the code.
-6. Optionally set `REQUIRED_EMAIL_DOMAIN` - defaults to `waktanjong.org`
-   if not set, so you only need this if MWT's domain ever changes.
-7. Keep `GEMINI_API_KEY` as-is (rotate it first if you haven't since it
-   was accidentally shown in a screenshot earlier).
+     this in after Part 2, if not already set from before)
+4. **Memory**: if you haven't already, raise this to **2 GiB** under
+   Containers -> Settings -> Resources (the default 512 MiB was enough to
+   OOM-kill the container on a large file before the GCS fix, and while
+   this version downloads more carefully, there's no reason to run it
+   tight - 2 GiB is cheap at this usage volume).
+5. Keep `UPLOAD_PASSPHRASE`, `GEMINI_API_KEY`, `REQUIRED_EMAIL_DOMAIN`
+   as already configured from the previous version.
 
 ### First-time setup (if deploying fresh)
 1. Google Cloud Console -> new project -> **enable billing**.
-2. Cloud Run -> **Deploy container** -> **Continuously deploy from a
+2. Create the GCS bucket and grant IAM permissions per the steps above.
+3. Cloud Run -> **Deploy container** -> **Continuously deploy from a
    repository** -> connect this repo.
-3. Region: `asia-southeast1` (closest to Singapore).
-4. **Authentication: Allow public access** (this is correct and
+4. Region: `asia-southeast1` (closest to Singapore, and matching the
+   bucket's region).
+5. **Authentication: Allow public access** (this is correct and
    intentional - the `UPLOAD_PASSPHRASE` check inside the app is what
    actually protects it, not Cloud Run's own auth gate; Cloud Run auth
    would block staff's browsers too, since they don't have Google
    identity tokens).
-5. **Billing: Request-based** (scales to zero between uses, free at
+6. **Billing: Request-based** (scales to zero between uses, free at
    MWT's volume).
-6. Environment variables (Variables & Secrets tab):
+7. **Memory: 2 GiB** (Containers -> Settings -> Resources).
+8. Environment variables (Variables & Secrets tab):
    - `GEMINI_API_KEY` = your Gemini API key
    - `UPLOAD_PASSPHRASE` = a simple shared phrase for staff
+   - `GCS_BUCKET_NAME` = your bucket name from above
    - `POWER_AUTOMATE_WEBHOOK_URL` = fill in after building Part 2
-7. **Container -> Settings -> Request timeout**: set to `600` seconds
+9. **Container -> Settings -> Request timeout**: set to `600` seconds
    (default 300s may not be enough for a long recording).
 8. Deploy. Copy the service URL - this is what you'll share with staff.
 
@@ -230,7 +293,17 @@ Cloud Run's own logs would show a spurious error). Response body:
   passphrase can trigger a paid Gemini call. Fine for an internal tool
   shared within a small organisation; if this becomes a problem, a
   proper login system would be the next step, but wasn't judged worth
-  the added complexity for MWT's scale and timeline.
+  the added complexity for MWT's scale and timeline. The signed GCS
+  upload URL is separately short-lived (30 minutes) and scoped to one
+  specific object, so it can't be reused or guessed even if intercepted.
+- **Orphaned GCS objects on rare failure paths** - the object is deleted
+  in a `finally` block after processing, which covers the normal
+  success/failure cases, but if Cloud Run itself crashes hard (e.g. an
+  OOM kill) between download and cleanup, the uploaded object could be
+  left in the bucket. Not cleaned up automatically in this version; worth
+  periodically checking the bucket's `uploads/` folder isn't
+  accumulating stale files, or adding a GCS lifecycle rule (delete
+  objects older than 1 day) as a backstop if this becomes a real issue.
 - **No download option in this version** - staff never see or download
   anything from the upload page itself; the only output is the Teams
   post. If someone needs the raw text later, it currently only exists in
@@ -287,3 +360,27 @@ maintainer understands why, rather than re-discovering the same dead ends:
    against the `@waktanjong.org` domain), passed through Cloud Run to
    Power Automate, which uses it to post the summary directly to that
    person's chat with Flow bot.
+7. **Uploading directly to Cloud Run (v3) worked for a 20MB test file but
+   failed silently on every real recording (200MB+), with zero server
+   logs for the failed requests.** Initial hypotheses - insufficient
+   container memory (raised 512 MiB -> 2 GiB), an intermittent Gemini
+   model 404 (switched to the `gemini-flash-latest` alias), a malformed
+   Power Automate payload on the failure path (fixed to always send a
+   consistent field shape) - were all real bugs worth fixing, but none
+   of them explained the silent failure on large files, since the
+   request was never reaching the container at all. A direct `curl`
+   test from Cloud Shell (bypassing the browser and local network as
+   variables) confirmed the actual cause: **Cloud Run enforces a hard,
+   non-configurable 32MB request size limit at Google's own front-end
+   load balancer**, returning `413 Request Entity Too Large` before the
+   container is even invoked - which is exactly why nothing ever showed
+   up in the container's logs. No setting in Cloud Run's console
+   (memory, timeout, concurrency) affects this; it's a platform-level
+   ceiling documented independently across several unrelated sources.
+   **This version (v4) fixes it properly**: the browser uploads the
+   large file directly to a Cloud Storage bucket using a short-lived
+   signed URL (GCS has no such limit), and Cloud Run only ever receives
+   a tiny "the file is at this path, go" request - well under 32MB
+   regardless of how large the actual recording is. Cloud Run then pulls
+   the file from GCS server-to-server, where the 32MB limit doesn't
+   apply either.

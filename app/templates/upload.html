@@ -121,7 +121,7 @@
       statusEl.innerHTML = type === 'working' ? '<span class="spinner"></span>' + message : message;
     }
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
       submitBtn.disabled = true;
       progressBar.style.display = 'block';
@@ -144,18 +144,49 @@
         return;
       }
 
-      const formData = new FormData();
-      formData.append('recording', recordingFile);
-      formData.append('passphrase', passphrase);
-      formData.append('meetingTitle', meetingTitle);
-      formData.append('staffEmail', staffEmail);
+      // Step 1: ask the server for a short-lived signed URL to upload
+      // directly to Cloud Storage. Cloud Run itself has a hard 32MB
+      // request size limit, so the actual recording can never go through
+      // /process directly - it goes straight to Cloud Storage instead,
+      // and Cloud Run only ever sees a tiny "here's where the file is"
+      // message afterwards.
+      setStatus('working', 'Preparing upload…');
 
+      let uploadUrl, objectName;
+      try {
+        const urlResp = await fetch('/upload-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            passphrase: passphrase,
+            staffEmail: staffEmail,
+            fileName: recordingFile.name,
+          }),
+        });
+        const urlResult = await urlResp.json();
+        if (!urlResult.success) {
+          setStatus('error', 'Something went wrong: ' + (urlResult.error || 'unknown error'));
+          submitBtn.disabled = false;
+          return;
+        }
+        uploadUrl = urlResult.uploadUrl;
+        objectName = urlResult.objectName;
+      } catch (err) {
+        setStatus('error', 'Could not start the upload — check your connection and try again.');
+        submitBtn.disabled = false;
+        return;
+      }
+
+      // Step 2: upload the actual file DIRECTLY to Cloud Storage using
+      // the signed URL. This request goes to Google Cloud Storage, not
+      // to this service, so Cloud Run's 32MB limit never applies here.
       setStatus('working', 'Uploading — this can take a while for large recordings, please keep this tab open…');
 
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/process', true);
+      const gcsUpload = new XMLHttpRequest();
+      gcsUpload.open('PUT', uploadUrl, true);
+      gcsUpload.setRequestHeader('Content-Type', 'application/octet-stream');
 
-      xhr.upload.onprogress = (event) => {
+      gcsUpload.upload.onprogress = (event) => {
         if (event.lengthComputable) {
           const pct = Math.round((event.loaded / event.total) * 100);
           progressBar.value = pct;
@@ -167,30 +198,48 @@
         }
       };
 
-      xhr.onload = () => {
-        submitBtn.disabled = false;
-        let result;
-        try {
-          result = JSON.parse(xhr.responseText);
-        } catch (err) {
-          setStatus('error', 'Unexpected response from server. Please try again or check with your admin.');
+      gcsUpload.onload = () => {
+        if (gcsUpload.status < 200 || gcsUpload.status >= 300) {
+          submitBtn.disabled = false;
+          setStatus('error', 'Upload to storage failed (status ' + gcsUpload.status + '). Please try again.');
           return;
         }
 
-        if (!result.success) {
-          setStatus('error', 'Something went wrong: ' + (result.error || 'unknown error'));
-          return;
-        }
-
-        setStatus('done', 'Done! The summary has been sent to your Teams chat with Flow bot.');
+        // Step 3: tell Cloud Run the file is ready to process. This is a
+        // small JSON request (just the object name), so it's unaffected
+        // by the 32MB limit regardless of how large the original
+        // recording was.
+        fetch('/process', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            passphrase: passphrase,
+            staffEmail: staffEmail,
+            meetingTitle: meetingTitle,
+            objectName: objectName,
+          }),
+        })
+          .then((resp) => resp.json())
+          .then((result) => {
+            submitBtn.disabled = false;
+            if (!result.success) {
+              setStatus('error', 'Something went wrong: ' + (result.error || 'unknown error'));
+              return;
+            }
+            setStatus('done', 'Done! The summary has been sent to your Teams chat with Flow bot.');
+          })
+          .catch(() => {
+            submitBtn.disabled = false;
+            setStatus('error', 'Upload succeeded, but processing could not be started. Please try again or check with your admin.');
+          });
       };
 
-      xhr.onerror = () => {
+      gcsUpload.onerror = () => {
         submitBtn.disabled = false;
         setStatus('error', 'Upload failed — check your connection and try again.');
       };
 
-      xhr.send(formData);
+      gcsUpload.send(recordingFile);
     });
   </script>
 </body>
