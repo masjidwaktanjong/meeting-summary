@@ -172,12 +172,7 @@ def get_upload_url():
         bucket = client.bucket(GCS_BUCKET_NAME)
         blob = bucket.blob(object_name)
 
-        upload_url = blob.generate_signed_url(
-            version="v4",
-            expiration=datetime.timedelta(minutes=30),
-            method="PUT",
-            content_type="application/octet-stream",
-        )
+        upload_url = _generate_signed_upload_url(blob)
 
         return jsonify({"success": True, "uploadUrl": upload_url, "objectName": object_name})
 
@@ -186,6 +181,48 @@ def get_upload_url():
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to generate upload URL")
         return jsonify({"success": False, "error": _scrub_secrets(str(e))}), 500
+
+
+def _generate_signed_upload_url(blob):
+    """
+    Generates a V4 signed URL for uploading to this blob.
+
+    Cloud Run's default (Application Default) credentials are a bare
+    token with no private key attached, so blob.generate_signed_url()
+    can't sign locally the normal way — it fails with "you need a
+    private key to sign credentials". The fix is to route signing
+    through the IAM Credentials API's signBlob method instead, acting as
+    the service account rather than trying to sign with a key that
+    doesn't exist locally. This requires:
+      - the "Service Account Token Creator" role granted to the
+        service's own service account (on itself) — see README Part 1
+      - the "Service Account Credentials API" enabled on the project
+        (Cloud Console -> APIs & Services -> Library -> search "IAM
+        Service Account Credentials API" -> Enable)
+    This is a well-documented Cloud Run + GCS papercut, not specific to
+    this project — see README Known limits for sources.
+    """
+    from google.auth import compute_engine
+    from google.auth.transport import requests as gauth_requests
+
+    credentials = _get_storage_client()._credentials
+    auth_request = gauth_requests.Request()
+
+    if not credentials.valid:
+        credentials.refresh(auth_request)
+
+    signing_credentials = compute_engine.IDTokenCredentials(
+        auth_request, "", service_account_email=credentials.service_account_email
+    )
+
+    return blob.generate_signed_url(
+        version="v4",
+        expiration=datetime.timedelta(minutes=30),
+        method="PUT",
+        content_type="application/octet-stream",
+        credentials=signing_credentials,
+        service_account_email=credentials.service_account_email,
+    )
 
 
 @app.route("/debug/models", methods=["GET"])

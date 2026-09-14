@@ -94,19 +94,28 @@ receive large uploads before Cloud Run processes them.
 **Grant the Cloud Run service account permission to sign URLs.**
 Generating a signed upload URL requires a specific IAM permission
 (`iam.serviceAccounts.signBlob`) that isn't included by default, even for
-a service that otherwise has full access to its own bucket:
-1. Cloud Console -> **IAM & Admin** -> find the service account Cloud Run
+a service that otherwise has full access to its own bucket. This is a
+well-documented Cloud Run + GCS papercut (Cloud Run's default credentials
+are a bare token with no private key attached, so signing has to be
+routed through the IAM API instead - the code already handles this, but
+it needs these two things enabled/granted first):
+
+1. **Enable the Service Account Credentials API** on the project - Cloud
+   Console -> **APIs & Services** -> **Library** -> search "IAM Service
+   Account Credentials API" -> **Enable**. Without this, signing fails
+   even with the correct IAM role granted below.
+2. Cloud Console -> **IAM & Admin** -> find the service account Cloud Run
    is running as (usually `PROJECT_NUMBER-compute@developer.gserviceaccount.com`,
    visible on your Cloud Run service's details page under "Security" or
    "Service account").
-2. Grant it the **Storage Admin** role on the bucket (or at minimum
+3. Grant it the **Storage Admin** role on the bucket (or at minimum
    **Storage Object Admin**, scoped to just this bucket, for tighter
    permissions) - this covers both the signed-URL generation and the
    service's own reads/deletes.
-3. Also grant it the **Service Account Token Creator** role (on itself) -
-   this is specifically what allows `generate_signed_url()` to work from
-   within Cloud Run; without it, signed URL generation fails with a
-   permissions error even though the bucket access itself is fine.
+4. Also grant it the **Service Account Token Creator** role (on itself) -
+   this is specifically what allows the IAM signBlob-based signing to
+   work from within Cloud Run; without it, signed URL generation fails
+   with a permissions error even though the bucket access itself is fine.
 
 ### Updating an existing deployment
 1. Push this folder's contents to the same GitHub repo Cloud Run is
