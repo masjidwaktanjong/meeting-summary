@@ -27,6 +27,7 @@ a specific Google account. See README.md for deploy steps.
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -40,7 +41,12 @@ logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 POWER_AUTOMATE_WEBHOOK_URL = os.environ.get("POWER_AUTOMATE_WEBHOOK_URL")  # where results get posted
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Gemini 2.5 models are being retired (shutdown announced for Oct 2026) and
+# were returning intermittent 404s on generateContent well before that date
+# — a known, widely-reported issue as the model family winds down. Using
+# the current Gemini 3 flash model instead. Override via env var if Google
+# renames/updates this again before you redeploy.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash")
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 
 # Simple shared passphrase, entered on the upload form itself, so a
@@ -181,7 +187,7 @@ def process_meeting():
 
     except Exception as e:  # noqa: BLE001 - always return JSON, never a raw 500 HTML page
         logger.exception("Failed to process meeting")
-        error_payload = {"success": False, "error": str(e)}
+        error_payload = {"success": False, "error": _scrub_secrets(str(e))}
         # Best-effort: let the Teams channel know it failed too, so
         # failures aren't silent even if the staff member closes the tab.
         try:
@@ -189,6 +195,25 @@ def process_meeting():
         except Exception:
             logger.exception("Also failed to notify Teams of the failure")
         return jsonify(error_payload), 500
+
+
+def _scrub_secrets(text):
+    """
+    Defense-in-depth: strips anything that looks like an API key from an
+    error message before it's ever returned to the browser or forwarded to
+    Teams. The Gemini calls now send the key as a header rather than a URL
+    parameter specifically to avoid this, but this catches it regardless —
+    e.g. if a future change reintroduces a key-in-URL pattern, or a
+    third-party library's own error message includes one.
+    """
+    if not text:
+        return text
+    # Covers "?key=XXXX" / "&key=XXXX" query-param style leaks.
+    text = re.sub(r"([?&]key=)[^&\s\"']+", r"\1***REDACTED***", text)
+    # Covers the actual configured key appearing verbatim anywhere else.
+    if GEMINI_API_KEY:
+        text = text.replace(GEMINI_API_KEY, "***REDACTED***")
+    return text
 
 
 def _forward_to_teams(payload):
@@ -272,10 +297,14 @@ def _gemini_upload_file(file_path, mime_type):
     file_size = os.path.getsize(file_path)
     display_name = os.path.basename(file_path)
 
-    # Step 1: start the resumable upload session.
+    # Step 1: start the resumable upload session. API key goes in a header
+    # (x-goog-api-key), not the URL — a key in the URL ends up echoed back
+    # verbatim in requests' HTTPError messages, which is how it previously
+    # leaked into an error shown in the browser.
     start_resp = requests.post(
-        f"{GEMINI_BASE}/upload/v1beta/files?key={GEMINI_API_KEY}",
+        f"{GEMINI_BASE}/upload/v1beta/files",
         headers={
+            "x-goog-api-key": GEMINI_API_KEY,
             "X-Goog-Upload-Protocol": "resumable",
             "X-Goog-Upload-Command": "start",
             "X-Goog-Upload-Header-Content-Length": str(file_size),
@@ -290,7 +319,8 @@ def _gemini_upload_file(file_path, mime_type):
     if not upload_url:
         raise RuntimeError(f"Gemini upload did not return an upload URL: {start_resp.text}")
 
-    # Step 2: upload the bytes and finalize.
+    # Step 2: upload the bytes and finalize. upload_url is a Google-issued
+    # session URL (no API key embedded), so nothing to scrub here.
     with open(file_path, "rb") as f:
         upload_resp = requests.post(
             upload_url,
@@ -321,7 +351,11 @@ def _wait_until_active(file_obj, max_attempts=45, poll_seconds=2):
     attempts = 0
     while state == "PROCESSING" and attempts < max_attempts:
         time.sleep(poll_seconds)
-        check_resp = requests.get(f"{GEMINI_BASE}/v1beta/{name}?key={GEMINI_API_KEY}", timeout=30)
+        check_resp = requests.get(
+            f"{GEMINI_BASE}/v1beta/{name}",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=30,
+        )
         check_resp.raise_for_status()
         checked = check_resp.json()
         state = checked.get("state")
@@ -369,7 +403,8 @@ def _gemini_summarize(file_uri, mime_type):
     }
 
     resp = requests.post(
-        f"{GEMINI_BASE}/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
+        f"{GEMINI_BASE}/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_API_KEY},
         json=request_body,
         timeout=600,
     )
