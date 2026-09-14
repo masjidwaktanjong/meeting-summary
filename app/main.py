@@ -104,6 +104,50 @@ def health():
     return jsonify({"status": "ok", "message": "MWT Meeting Summary API is running."})
 
 
+@app.route("/debug/models", methods=["GET"])
+def debug_list_models():
+    """
+    Diagnostic endpoint: lists models this Gemini API key actually has
+    access to, and which support generateContent. Useful when the
+    configured GEMINI_MODEL starts 404ing — model names/availability
+    change over time, and this reflects the real, current state for this
+    specific account rather than relying on documentation that may be
+    stale. Not linked from the upload page; visit directly when debugging.
+    """
+    try:
+        if not GEMINI_API_KEY:
+            return jsonify({"error": "GEMINI_API_KEY is not configured"}), 500
+
+        resp = requests.get(
+            f"{GEMINI_BASE}/v1beta/models",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        models = data.get("models", [])
+        supporting_generate = [
+            {
+                "name": m.get("name"),
+                "displayName": m.get("displayName"),
+                "supportedGenerationMethods": m.get("supportedGenerationMethods", []),
+            }
+            for m in models
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+        ]
+
+        return jsonify(
+            {
+                "currently_configured_model": GEMINI_MODEL,
+                "models_supporting_generateContent": supporting_generate,
+                "total_models_returned": len(models),
+            }
+        )
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": _scrub_secrets(str(e))}), 500
+
+
 @app.route("/process", methods=["POST"])
 def process_meeting():
     """
