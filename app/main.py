@@ -43,10 +43,13 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 POWER_AUTOMATE_WEBHOOK_URL = os.environ.get("POWER_AUTOMATE_WEBHOOK_URL")  # where results get posted
 # Gemini 2.5 models are being retired (shutdown announced for Oct 2026) and
 # were returning intermittent 404s on generateContent well before that date
-# — a known, widely-reported issue as the model family winds down. Using
-# the current Gemini 3 flash model instead. Override via env var if Google
-# renames/updates this again before you redeploy.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash")
+# — a known, widely-reported Google-side issue as the model family winds
+# down (confirmed present even for models still listed as available via
+# ListModels for this account — see /debug/models). Using the "-latest"
+# alias instead of a pinned model name specifically to avoid this problem
+# recurring: Google moves this alias forward as models are deprecated, so
+# it shouldn't need manual updating again the way a pinned name does.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 
 # Simple shared passphrase, entered on the upload form itself, so a
