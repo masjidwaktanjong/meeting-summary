@@ -166,21 +166,33 @@ def process_meeting():
     (if configured) so it can be posted into Teams, AND returns the same
     JSON directly to the browser so the upload page can show a live result
     without waiting on Teams.
+
+    Every payload forwarded to Power Automate — success or failure — always
+    includes the full set of fields (keyDiscussions/decisions/actionItems
+    as at least empty arrays, staffEmail as at least an empty string) even
+    when the failure happened before those values were known. This matters
+    because the Power Automate flow calls join() on these fields directly;
+    a missing field there is null, and join() throws on null rather than
+    treating it as empty — omitting fields on the error path previously
+    crashed the Teams-posting step for every failed upload.
     """
+    staff_email = ""  # populated once validated; used for error routing too
+    meeting_title = ""
+
     try:
         if UPLOAD_PASSPHRASE:
             provided = request.form.get("passphrase", "")
             if provided != UPLOAD_PASSPHRASE:
-                return jsonify({"success": False, "error": "Incorrect passphrase"}), 401
+                return _fail(401, "Incorrect passphrase", staff_email, meeting_title)
 
         staff_email = _validate_staff_email(request.form.get("staffEmail", ""))
 
         if "recording" not in request.files:
-            return jsonify({"success": False, "error": "No 'recording' file in upload"}), 400
+            return _fail(400, "No 'recording' file in upload", staff_email, meeting_title)
 
         uploaded = request.files["recording"]
         if uploaded.filename == "":
-            return jsonify({"success": False, "error": "Empty filename"}), 400
+            return _fail(400, "Empty filename", staff_email, meeting_title)
 
         file_name = uploaded.filename
         meeting_title = request.form.get("meetingTitle") or _strip_extension(file_name)
@@ -212,6 +224,7 @@ def process_meeting():
             "success": True,
             "title": meeting_title,
             "staffEmail": staff_email,
+            "error": "",
             "summary": result.get("summary", ""),
             "keyDiscussions": result.get("keyDiscussions", []),
             "decisions": result.get("decisions", []),
@@ -230,18 +243,39 @@ def process_meeting():
     except InvalidEmailError as e:
         # Deliberately returned before any file handling or Gemini calls
         # run, so a bad/missing email never triggers a paid API call.
-        return jsonify({"success": False, "error": str(e)}), 400
+        return _fail(400, str(e), staff_email, meeting_title)
 
     except Exception as e:  # noqa: BLE001 - always return JSON, never a raw 500 HTML page
         logger.exception("Failed to process meeting")
-        error_payload = {"success": False, "error": _scrub_secrets(str(e))}
-        # Best-effort: let the Teams channel know it failed too, so
-        # failures aren't silent even if the staff member closes the tab.
-        try:
-            _forward_to_teams(error_payload)
-        except Exception:
-            logger.exception("Also failed to notify Teams of the failure")
-        return jsonify(error_payload), 500
+        return _fail(500, _scrub_secrets(str(e)), staff_email, meeting_title)
+
+
+def _fail(status_code, error_message, staff_email, meeting_title):
+    """
+    Builds a failure response with the SAME field shape as a success
+    response (keyDiscussions/decisions/actionItems as empty arrays, not
+    missing), forwards it to Power Automate so failures aren't silent, and
+    returns the Flask response tuple. staffEmail may be empty if the
+    failure happened before the email was validated (e.g. bad passphrase)
+    — in that case Power Automate simply can't route the failure to a
+    specific person's chat, but the Teams flow should still handle an
+    empty string gracefully rather than crashing.
+    """
+    error_payload = {
+        "success": False,
+        "title": meeting_title,
+        "staffEmail": staff_email,
+        "error": error_message,
+        "summary": "",
+        "keyDiscussions": [],
+        "decisions": [],
+        "actionItems": [],
+    }
+    try:
+        _forward_to_teams(error_payload)
+    except Exception:
+        logger.exception("Also failed to notify Teams of the failure")
+    return jsonify(error_payload), status_code
 
 
 def _scrub_secrets(text):
@@ -422,7 +456,9 @@ def _gemini_summarize(file_uri, mime_type):
         "education organisation in Singapore. The conversation freely mixes "
         "English, Malay, and some Arabic (religious/technical terms). "
         "Listen to the full recording and produce: "
-        "(1) a concise overall summary (3-6 sentences); "
+        "(1) a brief overall summary (1-2 sentences, just enough to orient "
+        "someone who wasn't there - the detailed points belong in the "
+        "sections below, not the summary); "
         "(2) a list of key discussion points - the substantive topics "
         "raised and discussed, not just decisions; "
         "(3) a list of decisions made, stated clearly and specifically; "
