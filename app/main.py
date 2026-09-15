@@ -21,8 +21,8 @@ MWT's real recordings run 200MB+, the upload can't go straight to
        a. Strips the recording to audio-only using ffmpeg (real CPU work —
           why Cloud Run is used instead of an edge/Workers platform)
        b. Uploads the audio to Gemini's Files API
-       c. Asks Gemini for a structured summary: key discussions,
-          decisions, action items
+       c. Asks Gemini for a structured, topic-grouped summary: key points
+          per topic, and action items
        d. Forwards that small JSON result to a Power Automate "When a
           HTTP request is received" flow, which posts it into Teams
   4. The uploaded GCS object is deleted after processing (success or
@@ -64,6 +64,11 @@ GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")  # bucket for large-file upl
 # alias instead of a pinned model name specifically to avoid this problem
 # recurring: Google moves this alias forward as models are deprecated, so
 # it shouldn't need manual updating again the way a pinned name does.
+# To cut cost further, try setting GEMINI_MODEL="gemini-flash-lite-latest"
+# in Cloud Run's env vars — cheaper per token than standard Flash, and
+# likely fine for a summarization task, but test against a real
+# multilingual recording first to confirm quality holds up before
+# switching this permanently (see README "Known limits").
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 
@@ -288,8 +293,8 @@ def process_meeting():
     without waiting on Teams.
 
     Every payload forwarded to Power Automate — success or failure — always
-    includes the full set of fields (keyDiscussions/decisions/actionItems
-    as at least empty arrays, staffEmail as at least an empty string) even
+    includes the full set of fields (keyPoints/actionItems as at least
+    empty arrays, staffEmail as at least an empty string) even
     when the failure happened before those values were known. This matters
     because the Power Automate flow calls join() on these fields directly;
     a missing field there is null, and join() throws on null rather than
@@ -356,9 +361,7 @@ def process_meeting():
             "title": meeting_title,
             "staffEmail": staff_email,
             "error": "",
-            "summary": result.get("summary", ""),
-            "keyDiscussions": result.get("keyDiscussions", []),
-            "decisions": result.get("decisions", []),
+            "keyPoints": result.get("keyPoints", []),
             "actionItems": result.get("actionItems", []),
         }
 
@@ -394,22 +397,20 @@ def process_meeting():
 def _fail(status_code, error_message, staff_email, meeting_title):
     """
     Builds a failure response with the SAME field shape as a success
-    response (keyDiscussions/decisions/actionItems as empty arrays, not
-    missing), forwards it to Power Automate so failures aren't silent, and
-    returns the Flask response tuple. staffEmail may be empty if the
-    failure happened before the email was validated (e.g. bad passphrase)
-    — in that case Power Automate simply can't route the failure to a
-    specific person's chat, but the Teams flow should still handle an
-    empty string gracefully rather than crashing.
+    response (keyPoints/actionItems as empty arrays, not missing),
+    forwards it to Power Automate so failures aren't silent, and returns
+    the Flask response tuple. staffEmail may be empty if the failure
+    happened before the email was validated (e.g. bad passphrase) — in
+    that case Power Automate simply can't route the failure to a specific
+    person's chat, but the Teams flow should still handle an empty string
+    gracefully rather than crashing.
     """
     error_payload = {
         "success": False,
         "title": meeting_title,
         "staffEmail": staff_email,
         "error": error_message,
-        "summary": "",
-        "keyDiscussions": [],
-        "decisions": [],
+        "keyPoints": [],
         "actionItems": [],
     }
     try:
@@ -600,27 +601,34 @@ def _gemini_summarize(file_uri, mime_type):
         "content - do not compress or drop details to keep things short. "
         "Completeness matters more than brevity here; a longer list of "
         "short, specific bullets is far more useful than a shorter list of "
-        "dense, run-together ones. Produce: "
-        "(1) a brief overall summary (1-2 sentences, just enough to orient "
-        "someone who wasn't there - the actual detail belongs in the "
-        "sections below, not folded into this summary); "
-        "(2) keyDiscussions: EVERY distinct topic raised and discussed, "
-        "each as its OWN SEPARATE array element - never combine two or "
-        "more distinct points into one long element joined by commas or "
-        "semicolons. If five different things were discussed, return five "
-        "separate short strings, not one string listing all five. Each "
-        "element should be a single sentence or sentence fragment, "
-        "specific enough to stand alone; "
-        "(3) decisions: every concrete decision made, same rule - one "
-        "decision per array element, never merged; "
-        "(4) actionItems: every action item, one per array element, each "
-        "with the responsible person's name if mentioned in the recording "
-        "and, if a deadline or date was mentioned for that item, include "
+        "dense, run-together ones. "
+        "Produce a SINGLE merged set of key points, organised by topic - "
+        "do NOT separate 'discussion' from 'decisions' as two different "
+        "lists; readers found that repetitive and hard to follow, since "
+        "the same point often appeared in both. Instead, group everything "
+        "by the natural topic/subject it belongs to (e.g. 'Quick reply "
+        "revamp', 'Attendance bot', 'Response-time analytics' - infer "
+        "sensible topic names from what was actually discussed, however "
+        "many topics that takes). Under each topic, list what was "
+        "discussed AND decided about it together as a set of short, "
+        "point-form bullets (sentence fragments, not full narrative "
+        "sentences, and not merged into one run-on bullet). "
+        "Produce: "
+        "(1) keyPoints: an array of {topic, points} objects, one per "
+        "distinct topic, in the order topics came up in the meeting; "
+        "'topic' is a short bolded-style heading (a few words, e.g. "
+        "'Quick reply revamp'); 'points' is an array of short point-form "
+        "bullets covering everything discussed and decided about that "
+        "topic - one bullet per distinct point, never combined; "
+        "(2) actionItems: every action item mentioned anywhere in the "
+        "meeting, one per array element, each with the responsible "
+        "person's name if mentioned and, if a deadline/status was "
+        "mentioned (e.g. done, in progress, waiting on someone), include "
         "it in the same element. "
-        "Respond ONLY with valid JSON, no markdown fences, matching exactly "
-        "this shape: "
-        '{"summary": string, "keyDiscussions": [string], '
-        '"decisions": [string], "actionItems": [string]}'
+        "Respond ONLY with valid JSON, no markdown fences, matching "
+        "exactly this shape: "
+        '{"keyPoints": [{"topic": string, "points": [string]}], '
+        '"actionItems": [string]}'
     )
 
     request_body = {
@@ -659,9 +667,7 @@ def _gemini_summarize(file_uri, mime_type):
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Could not parse Gemini JSON output: {raw_text[:500]}") from e
 
-    result.setdefault("summary", "")
-    result.setdefault("keyDiscussions", [])
-    result.setdefault("decisions", [])
+    result.setdefault("keyPoints", [])
     result.setdefault("actionItems", [])
     return result
 
