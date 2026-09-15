@@ -1,7 +1,8 @@
 # MWT Meeting Summary API (v4 - Direct-to-Storage Upload + Teams Webhook)
 
 Staff visit a simple web page, upload their meeting recording, and a
-summary (key discussions, decisions, action items) is sent automatically
+summary (key points grouped by topic, plus action items) is sent
+automatically
 to their Teams chat with Flow bot a few minutes later. No folder-hunting,
 no separate transcript file, no Power Automate form with fiddly
 file-picker fields.
@@ -43,7 +44,7 @@ Cloud Run (this service)
         |  on server-to-server GCS reads)
         +- ffmpeg strips video, keeps audio-only (huge size reduction)
         +- Uploads audio to Gemini's Files API
-        +- Gemini produces: summary, key discussions, decisions, action items
+        +- Gemini produces: key points grouped by topic, action items
         +- Deletes the GCS object once done (success or failure)
         v
 Cloud Run POSTs the small JSON result to a Power Automate
@@ -178,6 +179,16 @@ This flow does the opposite of earlier versions: instead of *sending* a
 file, it *receives* a small JSON result from Cloud Run and posts it to
 Teams.
 
+**Note on the data shape**: `keyPoints` is a nested structure - an array
+of `{topic, points}` objects, one per topic Gemini identified, each with
+its own list of bullet points underneath. This is different from a flat
+array of strings, so it can't be turned into text with a single `join()`
+expression the way `actionItems` can. Building the message needs a loop
+(Apply to each) that appends each topic's heading and bullets into a
+running string as it goes. This is more steps than a typical Power
+Automate flow, but it's the only way to render nested, grouped data as
+formatted text.
+
 ### Step 1: Create the flow
 1. **make.powerautomate.com** -> **Create** -> **Instant cloud flow**
 2. Name: `MWT Meeting Summary - Post to Teams`
@@ -192,17 +203,20 @@ Teams.
      "success": true,
      "title": "Weekly Sync",
      "staffEmail": "hafizuddin@waktanjong.org",
-     "summary": "The team discussed...",
-     "keyDiscussions": ["Point one", "Point two"],
-     "decisions": ["Decision one"],
-     "actionItems": ["Action one"],
-     "error": ""
+     "error": "",
+     "keyPoints": [
+       {
+         "topic": "Quick reply revamp",
+         "points": ["Point one", "Point two"]
+       }
+     ],
+     "actionItems": ["Action one"]
    }
    ```
 2. Power Automate will generate the JSON schema automatically from this
-   sample - this is what lets you reference `title`, `summary`,
-   `staffEmail`, etc. as dynamic content later without a separate Parse
-   JSON step.
+   sample - this is what lets you reference `title`, `staffEmail`,
+   `keyPoints`, etc. as dynamic content later without a separate Parse
+   JSON step, and lets the `keyPoints` array be looped over correctly.
 3. **Save the flow once** (even without adding more steps yet) - this
    generates the actual webhook URL, shown at the top of the trigger card
    as **"HTTP POST URL"**. Copy this.
@@ -210,35 +224,56 @@ Teams.
    `POWER_AUTOMATE_WEBHOOK_URL` environment variable (Part 1 above), then
    redeploy the Cloud Run revision so it picks up the new variable.
 
-### Step 3: Post to the staff member's personal chat with Flow bot
-**+ New step** -> **"Post message in a chat or channel"** (Microsoft Teams connector)
+### Step 3: Build the Key Points section as formatted text
+
+1. **+ New step** -> **Initialize variable** (Variable connector)
+   - Name: `KeyPointsHtml`
+   - Type: **String**
+   - Value: leave empty - it gets built up inside the loop below
+
+2. **+ New step** -> **Apply to each** (Control connector)
+   - Select an output from previous steps -> pick `keyPoints` (from the
+     trigger's dynamic content)
+
+3. **Inside the Apply to each loop** -> **+ Add an action** -> **Append to
+   string variable** (Variable connector)
+   - Name: `KeyPointsHtml`
+   - Value: click the expression editor (fx) and enter:
+     ```
+     concat('<b>', item()?['topic'], '</b><br>- ', join(item()?['points'], concat('<br>', '- ')), '<br><br>')
+     ```
+   - This appends, for each topic: a bolded heading, a bulleted list of
+     its points (using `<br>` for line breaks since the message body
+     renders HTML - a plain `\n` gets silently collapsed by Teams' rich
+     text renderer, a known quirk this project hit earlier), then a
+     blank line before the next topic.
+
+### Step 4: Post to the staff member's personal chat with Flow bot
+
+**+ New step** (after the Apply to each loop closes) -> **"Post message
+in a chat or channel"** (Microsoft Teams connector)
 - Post as: **Flow bot**
 - Post in: **Chat with Flow bot**
 - Recipient: click into this field and insert the dynamic content
   `staffEmail` (from the trigger) - this addresses the message directly
   to whoever uploaded the recording, using the email they typed on the
   upload form.
-- Message: build the summary text using dynamic content, e.g.:
+- Message: switch the message editor to HTML view (the `</>` icon in the
+  toolbar) and build:
   ```
   📝 Meeting Summary: @{triggerBody()?['title']}
-
-  @{triggerBody()?['summary']}
-
-  Key Discussions:
-  - @{join(triggerBody()?['keyDiscussions'], '\n- ')}
-
-  Decisions Made:
-  - @{join(triggerBody()?['decisions'], '\n- ')}
-
+  <br><br>
+  Key Points
+  <br><br>
+  @{variables('KeyPointsHtml')}
+  <br>
   Action Items:
-  - @{join(triggerBody()?['actionItems'], '\n- ')}
+  <br>- @{join(triggerBody()?['actionItems'], concat('<br>', '- '))}
   ```
-  (Plain text works fine here since "Post message" doesn't render
-  Adaptive Cards the way "Post card in a chat or channel" does - if you
-  want the nicer card layout instead, swap this step for **"Post card in
-  a chat or channel"** with **Post in: Chat with Flow bot** and
-  **Recipient: staffEmail**, using the same Adaptive Card JSON structure
-  from the channel-posting version of this project.)
+  (Reference `variables('KeyPointsHtml')` - the string built by the loop
+  in Step 3 - rather than trying to reference `keyPoints` directly here,
+  since the trigger's raw `keyPoints` is still the unrendered nested
+  array at this point in the flow.)
 
 **Note on staffEmail validation**: Cloud Run already rejects any upload
 where the email doesn't end in `@waktanjong.org` before any processing
@@ -247,7 +282,7 @@ Power Automate receives this webhook call, `staffEmail` is guaranteed to
 be a real MWT address - safe to use directly as the chat recipient
 without extra validation in the flow itself.
 
-### Step 4: Handle failure
+### Step 5: Handle failure
 **+ New step** -> **Condition**
 - Left: dynamic content -> `success` (from the trigger)
 - Operator: **is equal to**
@@ -258,7 +293,7 @@ without extra validation in the flow itself.
   specific staff member their upload failed, rather than only logging it
   somewhere no one checks.
 
-### Step 5: Respond to Cloud Run (recommended)
+### Step 6: Respond to Cloud Run (recommended)
 Cloud Run's forwarding call waits up to 30 seconds for a response from
 this webhook. Add a **"Response"** action (Request connector) at the end
 returning a simple `200 OK` - without this, Power Automate's default
@@ -266,6 +301,25 @@ response can be slow enough to occasionally cause Cloud Run's forwarding
 call to time out (the Teams post itself would likely still succeed, but
 Cloud Run's own logs would show a spurious error). Response body:
 `{"status": "received"}`, status code `200`.
+
+### Flow structure summary
+
+For reference, the finished flow should run in this order:
+```
+1. When a HTTP request is received  (trigger)
+2. Initialize variable: KeyPointsHtml (empty string)
+3. Apply to each: keyPoints
+     -> Append to string variable: KeyPointsHtml
+4. Condition: success = false?
+     -> Yes: Post failure message to staffEmail's chat
+     -> No: (continue to step 5)
+5. Post message in a chat or channel (the actual summary, to staffEmail)
+6. Response (200 OK, back to Cloud Run)
+```
+Steps 4's two branches both eventually need the flow to end cleanly;
+the simplest arrangement is to put step 5 (the real summary post) in the
+Condition's "No" branch, and leave the "Yes" branch with just the failure
+message, so only one message is ever sent per run.
 
 ---
 
@@ -319,6 +373,13 @@ Cloud Run's own logs would show a spurious error). Response body:
   the Teams channel history and inside the Gemini/Cloud Run logs
   transiently, not saved anywhere durable. Worth flagging as a gap if
   MWT wants a searchable archive of past summaries later.
+- **Cost reduction not yet applied by default** - `GEMINI_MODEL` can be
+  set to `gemini-flash-lite-latest` (cheaper per token than the default
+  `gemini-flash-latest`) to cut ongoing Gemini spend further. Left as an
+  opt-in env var rather than the default, since Flash-Lite's summary
+  quality on MWT's specific English/Malay/Arabic code-switching hasn't
+  been validated yet - test it against a real recording before switching
+  permanently.
 
 ## Version history (for institutional record)
 
@@ -393,3 +454,16 @@ maintainer understands why, rather than re-discovering the same dead ends:
    regardless of how large the actual recording is. Cloud Run then pulls
    the file from GCS server-to-server, where the 32MB limit doesn't
    apply either.
+8. **Feedback from a real user (Nazlin) after the first live meeting
+   summary: the separate "Key Discussions" and "Decisions Made" sections
+   repeated the same points twice and were hard to follow.** Merged into
+   a single `keyPoints` section, grouped by topic (Gemini infers topic
+   names freely from what was actually discussed) with a bolded heading
+   per topic and point-form bullets underneath - matching the "Key
+   Points" style the org already uses elsewhere. This changed the
+   response shape from flat `keyDiscussions`/`decisions`/`summary`
+   fields to a single nested `keyPoints: [{topic, points}]` array, which
+   in turn required reworking the Power Automate message-building step
+   from simple `join()` expressions into an Initialize Variable + Apply
+   to Each + Append to String Variable loop, since Power Automate can't
+   flatten nested arrays into formatted text with a one-line expression.
